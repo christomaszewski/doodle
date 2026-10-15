@@ -13,6 +13,11 @@ verbs:
   # silently lower the power of the link operators may be using. Runtime changes go through the
   # launcher's own `tx-power` verb.
 ros_distro: lyrical
+# Infra: the radio is the vehicle's network link, like the zenoh router and mavlink-router. rig
+# brings infra up before every sensor and autonomy stack and takes it down after them, so the
+# link is at its startup power before anything else starts and the shutdown power is applied
+# only once everything else has stopped. `rig add` files the row under `infra:`.
+tier: infra
 
 # Example config `rig init` / `rig fetch` scaffold new instances from.
 examples:

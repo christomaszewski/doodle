@@ -52,6 +52,28 @@ ros2 param set /mesh/radio tx_power medium      # same values as tx-power, excep
 supported, capped by `max_dbm`), `off`, whole dBm, or `unchanged` (the default for both startup
 and shutdown). Out-of-range requests are rejected; the radio itself clamps silently.
 
+## Deploying with rig
+
+The service is an `infra` stack (`rigging.yaml`): rig starts it before every sensor and autonomy
+stack and stops it after them. On the dev machine, no radio password is needed:
+
+```bash
+rig add ../doodle --as mesh             # row under infra: (node /mesh/radio); then set host
+rig build                               # image on the fleet base; never renders configs
+rig bake --tag v1                       # fleet artifact: carries {{doodle_radio_password}} only
+```
+
+The artifact's `vehicle.local.example.yaml` lists `doodle_radio_password` as required. On each
+vehicle, provision it once with the bundled `sudo ./provision.sh --id <N> --name <name> --var
+doodle_radio_password='<password>'` (or `sudo rig provision --var …` on a vehicle that is already
+provisioned), then `rig up`.
+
+Dev-machine commands that render configs (`rig doctor`, `rig config`, `rig certify`,
+`rig image audit`, `rig up`) need some value for the var. Give a placeholder for that command
+only, `RIG_VAR_doodle_radio_password=unused rig image audit`, or put it under `vars:` in a bench
+`vehicle.local.yaml` beside `vehicle.yaml` (gitignored, never baked). Rendering never contacts the
+radio; only `rig up` would, and it would just fail to log in.
+
 ## Tests
 
 ```bash
