@@ -1,0 +1,147 @@
+#!/usr/bin/env bash
+# doodle-up <radio-config.yaml> [up [-d] | down | status | logs [args] | config | tx-power [value] | ...]
+#
+# Run the transmit-power and status service for ONE Doodle Labs radio from ONE rig config. Reads the
+# config, derives the instance identity (compose project = an inherited COMPOSE_PROJECT_NAME — rig
+# owns it — or doodle_<name> standalone) and runs `docker compose` on the static compose file. It
+# SELECTS + PARAMETERIZES that file; it never generates one.
+#
+#   doodle-up radios/mesh.yaml                 # up (foreground)
+#   doodle-up radios/mesh.yaml up -d           # detached; waits until the startup power is applied
+#   doodle-up radios/mesh.yaml status          # docker compose ps
+#   doodle-up radios/mesh.yaml logs -f
+#   doodle-up radios/mesh.yaml down            # applies tx_power.shutdown, then removes the container
+#   doodle-up radios/mesh.yaml config          # render the merged compose (contains no secrets)
+#   doodle-up radios/mesh.yaml tx-power        # status JSON on stdout (read-only)
+#   doodle-up radios/mesh.yaml tx-power low    # standby|low|medium|high|max|off|<dBm>|startup|unchanged
+#
+# One radio per config; each is its own compose project. This repo does NOT depend on rig (one-way;
+# see rigging.yaml).
+set -euo pipefail
+REPO="$(cd "$(dirname "$0")" && pwd)"
+PYTHON="${DOODLE_PYTHON:-python3}"
+
+CONFIG="${1:?usage: doodle-up <radio-config.yaml> [up [-d]|down|status|logs|config|tx-power [value]|...]}"
+shift || true
+[ -f "$CONFIG" ] || { echo "doodle-up: config not found: $CONFIG" >&2; exit 1; }
+CONFIG_ABS="$(cd "$(dirname "$CONFIG")" && pwd)/$(basename "$CONFIG")"
+
+if ! docker compose version >/dev/null 2>&1; then
+  echo "doodle-up: needs the Docker Compose v2 plugin ('docker compose')" >&2
+  exit 1
+fi
+
+# config -> SERVICE / NAME / NAMESPACE (plain tokens) and PASSWORD_FILE / DOODLE_CONFIG /
+# ZENOH_OVERRIDE (shell-quoted by the renderer, safe for this eval). Invalid config exits here,
+# before any container is touched.
+ENV_LINES="$("$PYTHON" "$REPO/tools/render_config.py" "$CONFIG_ABS")"
+eval "$(printf '%s\n' "$ENV_LINES" | sed 's/^/export /')"
+
+export DOODLE_NAME="$NAME"
+export DOODLE_NAMESPACE="$NAMESPACE"
+export DOODLE_ZENOH_OVERRIDE="$ZENOH_OVERRIDE"
+# Only the PATH reaches compose (as a `secrets:` file). The password itself never appears in the
+# rendered compose, so `config` output and `rig bake` artifacts carry no secret.
+export DOODLE_PASSWORD_FILE="$PASSWORD_FILE"
+export DOODLE_CONFIG
+
+# rig owns the compose project name (it exports COMPOSE_PROJECT_NAME per call); honor it when
+# inherited, fall back to <service>_<name> standalone. NEVER pass -p.
+export COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-${SERVICE}_${NAME}}"
+FILES=(-f "$REPO/docker/compose/compose.deploy.yaml")
+
+# No args = up. `status` -> `ps`. `tx-power` is ours; everything else goes to compose verbatim.
+ARGS=("$@")
+[ ${#ARGS[@]} -eq 0 ] && ARGS=(up)
+[ "${ARGS[0]}" = "status" ] && ARGS=(ps "${ARGS[@]:1}")
+
+# --- tx-power: talk to the running supervisor; never creates a container -------------------------
+# Stdout discipline: only the status JSON on stdout, human lines on stderr.
+if [ "${ARGS[0]}" = "tx-power" ]; then
+  if [ ${#ARGS[@]} -gt 2 ]; then
+    echo "doodle-up: usage: tx-power [standby|low|medium|high|max|off|<dBm>|startup|unchanged]" >&2
+    exit 2
+  fi
+  RUNNING="$(docker compose "${FILES[@]}" ps -q radio)" \
+    || { echo "doodle-up: cannot query compose project $COMPOSE_PROJECT_NAME" >&2; exit 1; }
+  if [ -z "$RUNNING" ]; then
+    if [ ${#ARGS[@]} -eq 1 ]; then
+      printf '{"service": "down", "detail": "no running container"}\n'
+      exit 0
+    fi
+    echo "doodle-up: tx-power: project $COMPOSE_PROJECT_NAME is down — run 'up' first" >&2
+    exit 1
+  fi
+  if [ ${#ARGS[@]} -eq 1 ]; then
+    exec docker compose "${FILES[@]}" exec -T radio /usr/local/bin/radioctl.sh status
+  fi
+  exec docker compose "${FILES[@]}" exec -T radio /usr/local/bin/radioctl.sh set "${ARGS[1]}"
+fi
+
+# --- creating a container needs the password file to exist -----------------------------------------
+case "${ARGS[0]}" in
+  up|create|run)
+    if [ ! -r "$DOODLE_PASSWORD_FILE" ]; then
+      echo "doodle-up: radio password file not readable: $DOODLE_PASSWORD_FILE" \
+           "(connection.ubus.password_file; see docs/RADIO_SETUP.md)" >&2
+      exit 1
+    fi
+    if ! "$PYTHON" -c 'import os, sys; sys.exit(os.stat(sys.argv[1]).st_mode & 0o077 != 0)' \
+         "$DOODLE_PASSWORD_FILE"; then
+      echo "doodle-up: warning: $DOODLE_PASSWORD_FILE is readable by other users (chmod 600 it)" >&2
+    fi
+    ;;
+esac
+
+# --- down: stop first so a failed shutdown power change is reported, then tear down ---------------
+# Compose down neither propagates the stopped container's exit status nor keeps its logs.
+if [ "${ARGS[0]}" = "down" ]; then
+  CONTAINERS="$(docker compose "${FILES[@]}" ps -aq radio)"
+  STOP_ARGS=(stop)
+  for ((i = 1; i < ${#ARGS[@]}; i++)); do
+    case "${ARGS[i]}" in
+      -t|--timeout)
+        STOP_ARGS+=("${ARGS[i]}" "${ARGS[i+1]:?missing stop timeout}")
+        i=$((i + 1)) ;;
+      --timeout=*|-t[0-9]*) STOP_ARGS+=("${ARGS[i]}") ;;
+    esac
+  done
+  DOWN_EXIT_STATUS=0
+  if [ -n "$CONTAINERS" ]; then
+    docker compose "${FILES[@]}" "${STOP_ARGS[@]}" radio
+    for container in $CONTAINERS; do
+      EXIT_CODE="$(docker inspect --format '{{.State.ExitCode}}' "$container")" || EXIT_CODE=unknown
+      if [ "$EXIT_CODE" != 0 ]; then
+        echo "doodle-up: shutdown failed (container $container exit $EXIT_CODE); radio power unconfirmed" >&2
+        docker logs --tail 40 "$container" >&2 || true
+        DOWN_EXIT_STATUS=1
+      fi
+    done
+  fi
+  docker compose "${FILES[@]}" "${ARGS[@]}" || DOWN_EXIT_STATUS=1
+  exit "$DOWN_EXIT_STATUS"
+fi
+
+# --- up -d: wait until the supervisor reports the target applied ----------------------------------
+DETACHED=""
+for a in "${ARGS[@]:1}"; do case "$a" in -d|--detach) DETACHED=1;; esac; done
+if [ "${ARGS[0]}" = "up" ] && [ -n "$DETACHED" ]; then
+  echo "doodle-up: project=$COMPOSE_PROJECT_NAME namespace=$NAMESPACE" >&2
+  docker compose "${FILES[@]}" "${ARGS[@]}"
+  SETTLE_BUDGET="${DOODLE_SETTLE_TIMEOUT:-120}"
+  DEADLINE=$((SECONDS + SETTLE_BUDGET))
+  while :; do
+    STATUS_JSON="$(docker compose "${FILES[@]}" exec -T radio /usr/local/bin/radioctl.sh status 2>/dev/null)" \
+      || STATUS_JSON=""
+    case "$STATUS_JSON" in *'"converged": true'*) exit 0 ;; esac
+    if [ "$SECONDS" -ge "$DEADLINE" ]; then
+      echo "doodle-up: radio did not reach its target within ${SETTLE_BUDGET}s" \
+           "(last status: ${STATUS_JSON:-unreachable}) — left up; check 'tx-power' / 'logs'" >&2
+      exit 1
+    fi
+    sleep 3
+  done
+fi
+
+echo "doodle-up: project=$COMPOSE_PROJECT_NAME namespace=$NAMESPACE" >&2
+exec docker compose "${FILES[@]}" "${ARGS[@]}"

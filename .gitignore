@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+# local instance configs and secrets
+radios/
+*.password

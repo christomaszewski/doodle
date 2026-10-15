@@ -1,0 +1,43 @@
+# syntax=docker/dockerfile:1
+# Runtime image for the doodle radio service: a Python supervisor on the ROS base, no compiled code.
+#
+#   docker build -f docker/Dockerfile.runtime -t doodle_radio:<tag> .
+#
+# Under rig, tools/build_image.sh forwards RIG_BASE_IMAGE so this image shares the deployment's one
+# base (fleet-ros); standalone builds use the slim ros-core parent.
+ARG ROS_DISTRO=lyrical
+ARG BASE_IMAGE=ros:${ROS_DISTRO}-ros-core
+
+FROM ${BASE_IMAGE}
+ARG ROS_DISTRO
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Hold the parent's ROS packages and never upgrade past them (the fleet convergence rule behind
+# `rig image audit`): new packages install, parent-carried ones stay at the parent's versions.
+RUN dpkg-query -W -f='${Package} ${db:Status-Status}\n' 'ros-*' \
+      | awk '$2 == "installed" {print $1}' | xargs -r apt-mark hold
+RUN printf 'APT::Install-Recommends "0";\nAPT::Install-Suggests "0";\nAPT::Get::Upgrade "false";\n' \
+      > /etc/apt/apt.conf.d/99-rig-apt-policy
+# Both RMWs ship (compose selects one via RMW_IMPLEMENTATION); diagnostic_msgs is what the
+# health publisher sends. Under the fleet-ros parent these are already present.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ros-${ROS_DISTRO}-rmw-fastrtps-cpp ros-${ROS_DISTRO}-rmw-zenoh-cpp \
+      ros-${ROS_DISTRO}-diagnostic-msgs \
+  && rm -rf /var/lib/apt/lists/*
+
+COPY docker/entrypoints/ros-entrypoint.sh docker/entrypoints/healthcheck.sh \
+     docker/entrypoints/radioctl.sh /usr/local/bin/
+COPY docker/entrypoints/doodle_config.py docker/entrypoints/power.py \
+     docker/entrypoints/radio_api.py docker/entrypoints/supervisor.py /usr/local/bin/
+RUN chmod +x /usr/local/bin/ros-entrypoint.sh /usr/local/bin/healthcheck.sh /usr/local/bin/radioctl.sh
+
+# Fail the build, not the vehicle, if a module or the ROS interfaces don't import.
+RUN source "/opt/ros/${ROS_DISTRO}/setup.bash" \
+ && cd /usr/local/bin && python3 -c "import supervisor, rclpy, diagnostic_msgs.msg"
+
+ENV LANG=C.UTF-8 LC_ALL=C.UTF-8
+HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 \
+  CMD ["/usr/local/bin/healthcheck.sh"]
+ENTRYPOINT ["/usr/local/bin/ros-entrypoint.sh"]
+CMD ["python3", "/usr/local/bin/supervisor.py", "serve"]
