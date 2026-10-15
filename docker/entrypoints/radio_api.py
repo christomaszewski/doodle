@@ -42,7 +42,12 @@ class AuthError(RadioError):
     """The radio rejected the API login."""
 
 
-class UbusError(RadioError):
+class ReplyError(RadioError):
+    """The radio answered, but not with what was asked for (a malformed reply or a JSON-RPC
+    error). Unlike an outage, other calls in the same pass can still succeed."""
+
+
+class UbusError(ReplyError):
     def __init__(self, what, status):
         self.status = status
         super().__init__(f"{what}: {UBUS_STATUS.get(status, f'ubus status {status}')}")
@@ -124,7 +129,7 @@ class RadioAPI:
                 raise
             except ValueError:
                 self.close()
-                raise RadioError("radio sent a reply that is not JSON") from None
+                raise ReplyError("radio sent a reply that is not JSON") from None
             except (ConnectionError, http.client.RemoteDisconnected) as error:
                 # A keep-alive connection the radio already closed: reconnect once.
                 self.close()
@@ -140,19 +145,19 @@ class RadioAPI:
         reply = self._transport({"jsonrpc": "2.0", "id": self._id, "method": "call",
                                  "params": params}, timeout or self.timeout)
         if not isinstance(reply, dict):
-            raise RadioError("radio sent a malformed reply")
+            raise ReplyError("radio sent a malformed reply")
         return reply
 
     @staticmethod
     def _data(what, reply):
         result = reply.get("result")
         if not isinstance(result, list) or not result or not isinstance(result[0], int):
-            raise RadioError(f"{what}: malformed reply")
+            raise ReplyError(f"{what}: malformed reply")
         if result[0] != 0:
             raise UbusError(what, result[0])
         data = result[1] if len(result) > 1 else {}
         if not isinstance(data, dict):
-            raise RadioError(f"{what}: malformed reply")
+            raise ReplyError(f"{what}: malformed reply")
         return data
 
     # --- session --------------------------------------------------------------------------------
@@ -189,7 +194,7 @@ class RadioAPI:
                         self._session = None  # expired or unknown session: log in again once
                         continue
                     message = error.get("message") if isinstance(error, dict) else None
-                    raise RadioError(f"{what}: {message or 'JSON-RPC error'}")
+                    raise ReplyError(f"{what}: {message or 'JSON-RPC error'}")
                 return self._data(what, reply)
 
     def missing_permissions(self, *needs):
@@ -232,7 +237,7 @@ class RadioAPI:
     def wireless(self):
         data = self.call("iwinfo", "info", {"device": self.device})
         return {key: data.get(key) for key in
-                ("txpower", "channel", "frequency", "noise", "country", "htmode", "bssid")}
+                ("txpower", "channel", "frequency", "noise", "country", "htmode", "bssid", "phy")}
 
     def txpower_list(self):
         data = self.call("iwinfo", "txpowerlist", {"device": self.device})
@@ -244,7 +249,7 @@ class RadioAPI:
         # The full reply includes the mesh key; only the up flag leaves this method.
         radio = self.call("network.wireless", "status").get(self.uci_radio)
         if not isinstance(radio, dict):
-            raise RadioError(f"the radio has no wireless device '{self.uci_radio}'")
+            raise ReplyError(f"the radio has no wireless device '{self.uci_radio}'")
         return radio.get("up") is True
 
     def power_control(self):
@@ -254,12 +259,17 @@ class RadioAPI:
                 "aggressive": str(values.get("dynamic_txpower_aggr", "0")).lower() in _TRUE,
                 "chanbw": values.get("chanbw")}
 
+    def read_text(self, path):
+        data = self.call("file", "read", {"path": path}).get("data")
+        if not isinstance(data, str):
+            raise ReplyError(f"file.read {path}: malformed reply")
+        return data
+
     def read_json(self, path):
-        data = self.call("file", "read", {"path": path})
         try:
-            return json.loads(data.get("data", ""))
+            return json.loads(self.read_text(path))
         except ValueError:
-            raise RadioError(f"{path} on the radio is not JSON") from None
+            raise ReplyError(f"{path} on the radio is not JSON") from None
 
     # --- writes (live only; nothing here touches flash) ------------------------------------------
 

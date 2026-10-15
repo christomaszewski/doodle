@@ -3,7 +3,7 @@
 #
 # Multi-instance safe: no container_name; identity comes from the compose project (the rig-injected
 # COMPOSE_PROJECT_NAME, or doodle_<name> standalone). Health comes from the image's HEALTHCHECK
-# (the supervisor reports whether the radio is reachable and at its target power).
+# (the radio is reachable and at its target power, and diagnostics are publishing).
 services:
   radio:
     # Image precedence: DOODLE_IMAGE (full override) wins; else the rig fleet policy —

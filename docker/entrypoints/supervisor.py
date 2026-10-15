@@ -2,13 +2,14 @@
 """Own one radio's transmit power within one running container.
 
 Only the supervisor changes the radio. Requests arrive over a local Unix socket (radioctl.sh,
-`doodle-up tx-power`). A reconcile pass every few seconds keeps the radio at its target across
-radio reboots, wifi restarts and RF toggles; SIGTERM applies tx_power.shutdown and confirms it.
-Every change is live (nothing is written to the radio's flash) and is read back.
+`doodle-up tx-power`) and as the ROS parameter `tx_power` (health_ros.py). A reconcile pass every
+few seconds keeps the radio at its target across radio reboots, wifi restarts and RF toggles;
+SIGTERM applies tx_power.shutdown and confirms it. Every change is live (nothing is written to the
+radio's flash) and is read back. Diagnostics run beside it (health.py) and only read.
 
   supervisor.py serve | status | set <value> | health
 """
-from contextlib import nullcontext
+import contextlib
 import fcntl
 import json
 import logging
@@ -34,6 +35,7 @@ LOCK_WAIT = 20          # a request queued behind another change fails after thi
 RF_TIMEOUT = 90         # RF on (observed: < 40 s) or off
 APPLY_TIMEOUT = 10      # power read-back after `iw set txpower`
 SHUTDOWN_BUDGET = 45    # inside compose's 60 s stop grace period
+HEALTH_TIMEOUT = 2.0    # per diagnostics request
 
 
 class Controller:
@@ -47,6 +49,10 @@ class Controller:
         self.rf_timeout, self.apply_timeout, self.poll = rf_timeout, apply_timeout, poll
         self.lock = threading.Lock()
         self.uptime = None
+        self.changing = ""      # what a write in progress is doing, for diagnostics
+        self.observed_at = None  # monotonic time of the latest snapshot
+        self.generation = 0      # increments with every snapshot (diagnostics sample id)
+        self.diagnostics = "off"  # set by the ROS health monitor
         self._permissions_checked = False
         self._supported = (None, [])  # (frequency, txpowerlist) — re-read when the channel moves
         self.target = self._load_target()
@@ -134,18 +140,25 @@ class Controller:
 
     def _record(self, observation, error=""):
         self.snapshot = self._snapshot(self.target, observation, error)
+        self.observed_at = self.clock()
+        self.generation += 1
         return self.snapshot
+
+    def health_state(self):
+        """For the diagnostics heartbeat: plain attribute reads, never the lock or the radio."""
+        return {"snapshot": self.snapshot, "at": self.observed_at, "sample_id": self.generation,
+                "changing": self.changing}
 
     def status(self):
         """Fresh read-only status; while a change runs, the last snapshot marked busy."""
         if not self.lock.acquire(blocking=False):
-            return dict(self.snapshot, busy=True)
+            return dict(self.snapshot, busy=True, diagnostics=self.diagnostics)
         try:
             try:
                 self._record(self.observe())
             except RadioError as error:
                 self._record(None, str(error))
-            return dict(self.snapshot, busy=False)
+            return dict(self.snapshot, busy=False, diagnostics=self.diagnostics)
         finally:
             self.lock.release()
 
@@ -173,6 +186,12 @@ class Controller:
 
     def apply(self, target, *, deadline, stop_aware=True):
         """Bring the radio to `target`; read everything back. Writes only what differs."""
+        try:
+            return self._apply(target, deadline, stop_aware)
+        finally:
+            self.changing = ""
+
+    def _apply(self, target, deadline, stop_aware):
         observation = self.observe()
         if target == "unchanged":
             return observation
@@ -180,6 +199,7 @@ class Controller:
             if observation["rf"] == "on":
                 self.radio.require("rf_toggle")
                 LOG.info("turning RF off")
+                self.changing = "turning RF off"
                 self.radio.set_rf(False)
                 observation = self._wait_for(lambda o: o["rf"] == "off", deadline, "RF off",
                                              stop_aware)
@@ -187,6 +207,7 @@ class Controller:
         if observation["rf"] == "off":
             self.radio.require("rf_toggle")
             LOG.info("turning RF on")
+            self.changing = "turning RF on"
             self.radio.set_rf(True)
             observation = self._wait_for(
                 lambda o: o["rf"] == "on" and o["supported"] and o["tx_power_dbm"] is not None,
@@ -196,6 +217,7 @@ class Controller:
             self.radio.require("set_power")
             LOG.info("setting transmit power to %s dBm (radio at %s dBm)", wanted,
                      observation["tx_power_dbm"])
+            self.changing = f"setting {wanted} dBm"
             self.radio.set_txpower(wanted)
             observation = self._wait_for(lambda o: o["tx_power_dbm"] == wanted,
                                          min(deadline, self.clock() + self.apply_timeout),
@@ -316,13 +338,24 @@ def read_password(path):
     return password
 
 
-def serve(*, monitor=None):
+def health_monitor(controller, config, stop_event, health_radio):
+    """The ROS diagnostics publisher, unless DOODLE_DIAGNOSTICS=off (tests without ROS)."""
+    if os.environ.get("DOODLE_DIAGNOSTICS", "on") == "off":
+        return contextlib.nullcontext()
+    from health_ros import ros_health  # rclpy is imported only here
+    return ros_health(controller, config, stop_event, health_radio)
+
+
+def serve(*, monitor=health_monitor):
     stop_event = threading.Event()
     signal.signal(signal.SIGTERM, lambda *_: stop_event.set())
     signal.signal(signal.SIGINT, lambda *_: stop_event.set())
     config = doodle_config.runtime(json.loads(os.environ.get("DOODLE_CONFIG") or "{}"))
     connection = config["connection"]
-    radio = RadioAPI.from_config(connection, read_password(SECRET_FILE))
+    password = read_password(SECRET_FILE)
+    radio = RadioAPI.from_config(connection, password)
+    # Diagnostics read with their own session and short timeouts, so they never wait on a change.
+    health_radio = RadioAPI.from_config(connection, password, timeout=HEALTH_TIMEOUT)
     controller = Controller(radio, config["tx_power"], TARGET_FILE, stop_event=stop_event)
     LOG.info("radio %s://%s as %s; target %s, shutdown %s", connection["scheme"],
              connection["host"], connection["username"], power.describe(controller.target),
@@ -337,30 +370,46 @@ def serve(*, monitor=None):
             server.controller = controller
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()
-            try:
-                with (monitor or (lambda *_: nullcontext()))(controller, config, stop_event):
-                    last_error, logged_at = None, 0.0
-                    while not stop_event.is_set():
-                        try:
-                            error = controller.reconcile().get("error")
-                        except Exception as unexpected:  # a bug must not end power control
-                            LOG.exception("reconcile failed")
-                            error = f"internal error: {unexpected}"
-                        if error and (error != last_error or time.monotonic() - logged_at > 60):
-                            LOG.warning("%s", error)
-                            logged_at = time.monotonic()
-                        elif not error and last_error:
-                            LOG.info("recovered: %s", controller.snapshot["detail"])
-                        last_error = error
-                        stop_event.wait(RECONCILE_INTERVAL)
-            finally:
+            finished = False
+
+            def finish():
+                """Stop requests, then apply the shutdown power — before ROS is torn down, so a
+                slow ROS shutdown can never cost the radio its shutdown setting."""
+                nonlocal finished
+                if finished:
+                    return
+                finished = True
                 stop_event.set()
                 server.shutdown()
                 thread.join()
+                controller.shutdown()
+
+            try:
+                with monitor(controller, config, stop_event, health_radio):
+                    try:
+                        last_error, logged_at = None, 0.0
+                        while not stop_event.is_set():
+                            try:
+                                error = controller.reconcile().get("error")
+                            except Exception as unexpected:  # a bug must not end power control
+                                LOG.exception("reconcile failed")
+                                error = f"internal error: {unexpected}"
+                            if error and (error != last_error
+                                          or time.monotonic() - logged_at > 60):
+                                LOG.warning("%s", error)
+                                logged_at = time.monotonic()
+                            elif not error and last_error:
+                                LOG.info("recovered: %s", controller.snapshot["detail"])
+                            last_error = error
+                            stop_event.wait(RECONCILE_INTERVAL)
+                    finally:
+                        finish()
+            finally:
                 try:
-                    controller.shutdown()
+                    finish()  # also when the monitor itself failed to start or stop
                 finally:
                     radio.close()
+                    health_radio.close()
                     path.unlink(missing_ok=True)
 
 
@@ -389,7 +438,8 @@ def main(argv=None):
             print(json.dumps(client("set", args[1], timeout=LOCK_WAIT + RF_TIMEOUT + 30)))
         elif args == ["health"]:
             status = client("status", timeout=8)
-            return 0 if status.get("converged") and not status.get("error") else 1
+            healthy = status.get("converged") and not status.get("error")
+            return 0 if healthy and not str(status.get("diagnostics")).startswith("failed") else 1
         else:
             sys.stderr.write("usage: supervisor.py serve | status | set <value> | health\n")
             return 2

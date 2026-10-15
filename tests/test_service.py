@@ -1,5 +1,6 @@
 """The supervisor process end to end: real HTTP to a simulated radio, the control socket, the
 health check, SIGTERM shutdown, exit status, and logs free of secrets."""
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -39,6 +40,8 @@ class ServiceTests(unittest.TestCase):
                         DOODLE_SECRET_FILE=str(secret),
                         DOODLE_CONTROL_SOCKET=str(tmp / "control.sock"),
                         DOODLE_TARGET_FILE=str(tmp / "target.json"))
+        if not importlib.util.find_spec("rclpy"):
+            self.env["DOODLE_DIAGNOSTICS"] = "off"  # in the image, diagnostics run for real
         self.log = open(tmp / "supervisor.log", "w+")
         self.addCleanup(self.log.close)
         self.process = subprocess.Popen([sys.executable, str(SUPERVISOR), "serve"], env=self.env,

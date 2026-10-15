@@ -1,12 +1,13 @@
 # doodle
 
 Doodle Labs radio status and config rig service: sets a Mesh Rider radio's transmit power
-(with configurable startup and shutdown values) and, in Phase 3, reports radio and link status as
-standard ROS 2 diagnostics. Built for the in-house **rig** orchestrator and ROS 2 Lyrical; it does
-not depend on rig.
+(with configurable startup and shutdown values) and reports radio and link status as standard
+ROS 2 diagnostics. Built for the in-house **rig** orchestrator and ROS 2 Lyrical; it does not
+depend on rig.
 
-Status: Phases 1–2 of [docs/PLAN.md](docs/PLAN.md) — launcher, image, CI, radio client and power
-supervisor. Health reporting (Phase 3) is next.
+Status: Phases 1–3 of [docs/PLAN.md](docs/PLAN.md) — launcher, image, CI, radio client, power
+supervisor, diagnostics and the ROS `tx_power` parameter. Tested against a simulated radio;
+hardware checks are listed in the plan.
 
 ## How it works
 
@@ -16,6 +17,8 @@ supervisor. Health reporting (Phase 3) is next.
 | `tools/render_config.py` + `docker/entrypoints/doodle_config.py` | One validator for the launcher and the container |
 | `docker/entrypoints/supervisor.py` | The only writer: applies the target, re-applies it after radio reboots and RF toggles, applies the shutdown value |
 | `docker/entrypoints/radio_api.py` | The radio's ubus JSON-RPC API over HTTPS; see [docs/RADIO_API.md](docs/RADIO_API.md) |
+| `docker/entrypoints/health.py` | Read-only radio, link and system observations as diagnostics ([docs/SERVICE_HEALTH.md](docs/SERVICE_HEALTH.md)) |
+| `docker/entrypoints/health_ros.py` | The ROS node `/<namespace>/radio`: `/diagnostics` and the `tx_power` parameter |
 | `docker/compose/compose.deploy.yaml` | One container per radio; the password arrives as a compose secret the launcher writes |
 | `rigging.yaml` | Tells rig how to drive `doodle-up` |
 
@@ -40,6 +43,9 @@ cp sensors/doodle.example.yaml radios/mesh.yaml   # set host, password, tx_power
 ./doodle-up radios/mesh.yaml tx-power     # {"target": ..., "tx_power_dbm": ..., "converged": ...}
 ./doodle-up radios/mesh.yaml tx-power low
 ./doodle-up radios/mesh.yaml down         # applies tx_power.shutdown; nonzero if unconfirmed
+
+ros2 topic echo /diagnostics                     # service, radio, links, link/<mac>, system, …
+ros2 param set /mesh/radio tx_power medium      # same values as tx-power, except off
 ```
 
 `tx_power` values: `standby` (lowest supported), `low`, `medium`, `high`/`max` (highest
@@ -53,5 +59,5 @@ python3 -m unittest discover -s tests -v   # needs PyYAML; Docker Compose for th
 ```
 
 The suites run against a simulated radio (`tests/fake_radio.py`) whose replies follow the
-measured API. CI also builds the image, runs the supervisor suites inside it, and runs
-`rig certify`.
+measured API. CI also builds the image, runs the supervisor and ROS suites inside it (real
+`/diagnostics` and parameter calls), and runs `rig certify`.

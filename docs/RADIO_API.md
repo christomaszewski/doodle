@@ -48,13 +48,21 @@ firewall accepts all incoming connections from the mesh. Fielded radios need a s
 |---|---|---|
 | Identity | `system board` | `release.version`, `parent_model`, `sub_model`, `hostname` |
 | Reboot detection, load | `system info` | `uptime` (s), `load` (×65536), `memory` |
-| Effective power | `iwinfo info {device}` | `txpower` (int dBm), `channel`, `frequency`, `noise`, `country`, `htmode` |
+| Effective power | `iwinfo info {device}` | `txpower` (int dBm), `channel`, `frequency`, `noise`, `country`, `htmode`, `phy` |
 | Supported power range | `iwinfo txpowerlist {device}` | `results[].dbm` (19…32 on the tested radio), `active` |
 | Automatic power control | `uci get {config:wireless, section:<radio>}` | `values.dynamic_txpower`, `dynamic_txpower_aggr`, `chanbw` |
 | RF on/off | `network.wireless status` | `<radio>.up` |
 | Link status | `file read {path:/tmp/linkstate_current.json}` | see below |
+| ACK/broadcast power | `file read {path:/sys/kernel/debug/ieee80211/<phy>/ath9k/txpower_selfgen}` (and `txpower_mcast`) | integer dBm, 255 = follow the level |
 | **Set power** | `file exec {command:/usr/sbin/iw, params:[dev,<device>,set,txpower,fixed,<dBm×100>]}` | reply `{code, stdout, stderr}` |
 | **RF off / on** | `network.wireless down` / `up` `{device:<radio>}` | — |
+
+Two sessions: the supervisor's (changes and the reconcile reads) and the diagnostics poll's
+(every 5 s: `system info`, `network.wireless status`, `iwinfo info`, `uci get`, the link report
+and the two debugfs files; `system board` once and after a reboot). Reading the link report and
+the debugfs files *through the API* is not yet verified on hardware (they were read over SSH):
+an empty or missing debugfs reply is reported as `unsupported`, a failed link-report read as
+`unavailable`.
 
 Never called: `link-status logs` (exports the long-term log as an archive in `/tmp`, which is
 RAM), anything that commits UCI or writes flash.

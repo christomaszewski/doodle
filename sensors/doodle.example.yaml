@@ -7,7 +7,7 @@ name: mesh                      # rig instance / health identity; standalone com
 # service/name/ros.namespace must match [a-z][a-z0-9_]*. Rig can supply name from vehicle.yaml.
 
 ros:
-  namespace: mesh               # defaults to name; the ROS node is /<namespace>/radio (Phase 3)
+  namespace: mesh               # defaults to name; the ROS node is /<namespace>/radio
 
 connection:
   type: ubus                    # the radio's JSON-RPC API (only supported transport)
@@ -48,15 +48,19 @@ tx_power:
   #   medium: 27
   # max_dbm: 30                 # optional cap for high/max and numeric requests (licence or
   #                             # datasheet limit; the radio's regulatory domain may allow more)
-  # Runtime changes: ./doodle-up <config> tx-power <value>  (`startup` returns to the value above).
+  # Runtime changes: ./doodle-up <config> tx-power <value>  (`startup` returns to the value above),
+  # or over ROS: ros2 param set /<namespace>/radio tx_power <value>  (any value except off).
   # Requests outside the radio's supported range are rejected — the radio itself clamps silently.
 
-# Health reporting (Phase 3): standard diagnostic_msgs/DiagnosticArray on /diagnostics.
+# Health reporting: diagnostic_msgs/DiagnosticArray on /diagnostics (docs/SERVICE_HEALTH.md;
+# components and keys in docs/PLAN.md).
 # health:
 #   interval_s: 1               # diagnostic heartbeat period
 #   poll_interval_s: 5          # radio polling period
 #   stale_after_s: 15           # observation validity
-#   limits: {}                  # metric -> warn_above/warn_below/error_above/error_below
+#   limits:                     # metric -> warn_above/warn_below/error_above/error_below
+#     links.stations: {warn_below: 1}     # e.g. warn when no peer is in range
+#     rf.noise_dbm: {warn_above: -85}     # e.g. warn on a noisy channel
 
 # Zenoh session settings (only with RMW_IMPLEMENTATION=rmw_zenoh_cpp); same block as the other rig
 # ROS services. `overrides` (nested config flattened to path=json pairs) is the useful part here;

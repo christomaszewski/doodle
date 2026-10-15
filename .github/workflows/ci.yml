@@ -24,8 +24,8 @@ defaults:
 jobs:
   # ---------------------------------------------------------------------------
   # Build the runtime image (no push: `rig build` / tools/build_image.sh
-  # publishes), then run the supervisor and radio-client suites inside it so the
-  # INSTALLED entrypoints are what gets exercised.
+  # publishes), then run the supervisor, radio-client and ROS suites inside it so
+  # the INSTALLED entrypoints (and real rclpy) are what gets exercised.
   # ---------------------------------------------------------------------------
   build-image:
     runs-on: ubuntu-latest
@@ -48,7 +48,8 @@ jobs:
           docker run --rm --init --network none \
             -e DOODLE_TEST_ENTRYPOINT_DIR=/usr/local/bin \
             -v "$PWD:/workspace:ro" -w /workspace/tests doodle_radio:ci \
-            python3 -m unittest test_radio_api test_supervisor test_service -v
+            python3 -m unittest test_radio_api test_supervisor test_service test_health \
+              test_health_ros -v
 
   # ---------------------------------------------------------------------------
   # rig launcher contract, executable (see rigging.yaml): `rig certify` renders

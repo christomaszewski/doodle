@@ -34,7 +34,11 @@ class FakeRadio:
         self.dynamic_txpower = "1"
         self.ignore_txpower = False      # a radio that accepts `iw` but does not change
         self.fail = {}                   # "object.method" -> ubus status to return
+        self.unreadable = set()          # file paths whose `file read` answers "not found"
         self.unreachable = False
+        # ath9k_tpcd's ACK/broadcast power overrides (255 = follow the level), read via debugfs
+        self.debugfs = {"txpower_selfgen": "255\n", "txpower_mcast": "255\n"}
+        self.sta_stats, self.mesh_stats = [], []  # linkstate peer entries (format synthetic)
 
     # --- scenario helpers ------------------------------------------------------------------------
 
@@ -154,13 +158,20 @@ class FakeRadio:
                 return {"code": 0}  # exits 0 even when it clamped
             return {"code": 1, "stderr": "unexpected command"}
         if (obj, method) == ("file", "read"):
-            if args.get("path") == "/tmp/linkstate_current.json":
+            path = args.get("path")
+            if path in self.unreadable:
+                return [NOT_FOUND]
+            if path == "/tmp/linkstate_current.json":
                 return {"data": json.dumps({
                     "sysinfo": {"cpu_load": [20000, 18000, 19000], "freemem": 12000000,
                                 "localtime": 1700000000},
                     "oper_chan": self.channel, "oper_freq": self.frequency, "chan_width": "20",
                     "noise": -94.0, "noise_peak": -92.0, "activity": 1, "lna_status": "1",
-                    "sta_count": 0, "sta_stats": [], "mesh_count": 0, "mesh_stats": []})}
+                    "sta_count": len(self.sta_stats), "sta_stats": self.sta_stats,
+                    "mesh_count": len(self.mesh_stats), "mesh_stats": self.mesh_stats})}
+            prefix = "/sys/kernel/debug/ieee80211/phy0/ath9k/"
+            if self.rf_up and path.startswith(prefix) and path[len(prefix):] in self.debugfs:
+                return {"data": self.debugfs[path[len(prefix):]]}
             return [NOT_FOUND]
         return [3]  # method not found
 
