@@ -24,8 +24,8 @@ build:
   command: tools/build_image.sh
   images: [doodle_radio]
 
-# No `msgs:` block: the service publishes only diagnostic_msgs (and later rcl_interfaces
-# parameters), which ros-core/common_interfaces already carry. No host ports (it is an HTTPS
+# No `msgs:` block: the service uses only diagnostic_msgs and rcl_interfaces (the tx_power
+# parameter), which ros-core and the fleet-ros base already carry. No host ports (it is an HTTPS
 # client of the radio) and no external volumes (runtime requests live in the container).
 
 # Files rig vendors onto the vehicle to run this service. The runtime is the published image, so
