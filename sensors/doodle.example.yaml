@@ -1,0 +1,81 @@
+# Doodle Labs radio rig service config: one file per radio.
+# Copy per radio, then:  ./doodle-up radios/mesh.yaml up -d
+# Schema and validation: docker/entrypoints/doodle_config.py. Radio preparation: docs/RADIO_SETUP.md.
+
+service: doodle
+name: mesh                      # rig instance / health identity; standalone compose project doodle_mesh
+# service/name/ros.namespace must match [a-z][a-z0-9_]*. Rig can supply name from vehicle.yaml.
+
+ros:
+  namespace: mesh               # defaults to name; the ROS node is /<namespace>/radio
+
+connection:
+  type: ubus                    # the radio's JSON-RPC API (only supported transport)
+  ubus:
+    host: 10.223.18.52          # required: the radio's management address
+    # scheme: https             # https (default; the radio uses a self-signed certificate) | http
+    # port: 443                 # default for the scheme
+    # username: user            # firmware 2025-06+ API login; do not use root
+    password: "{{doodle_radio_password}}"
+    # Required: the API password of the radio's `user` login (root is never used). Under rig,
+    # keep it out of this file: reference a vehicle-local var as above and provision it once per
+    # vehicle with
+    #   sudo rig provision --var doodle_radio_password='<password>'
+    # rig fills it in on the vehicle from /etc/rig/vehicle.local.yaml, and `rig bake` never reads
+    # that file, so artifacts carry only the marker. Standalone, put the password itself here and
+    # keep the config out of git. Quote it: YAML would turn 012345 into a number.
+    # The launcher writes it to var/run/<name>.radio_password (0600) when it creates the
+    # container; it never appears in the rendered compose or the container's environment.
+    # tls_fingerprint_sha256: ""  # optional SHA-256 pin of the radio's certificate (64 hex
+    #                             # digits, colons allowed). Empty = encrypted but not
+    #                             # authenticated. A renewed radio certificate changes it.
+    # device: wlan0             # wireless interface on the radio
+    # uci_radio: radio0         # its wifi-device section
+
+tx_power:
+  # Values: standby | low | medium | high | max | off | <whole dBm> | unchanged
+  #   standby       lowest power the radio supports (19 dBm on the tested radio)
+  #   high, max     highest supported, capped by max_dbm (32 dBm on that radio)
+  #   low, medium   one and two thirds of the way between, rounded down to a supported value
+  #   off           transmitter off (wireless interface down); nothing is written to flash, so a
+  #                 radio power cycle always brings RF back. Wired management stays reachable.
+  #   unchanged     never touch the radio's power
+  # A bare `off` is YAML for false; both spellings mean off here.
+  startup: unchanged            # applied when the container starts; omitted = unchanged
+  shutdown: unchanged           # applied on rig down / docker stop / Ctrl-C; omitted = unchanged
+  # levels:                     # optional overrides, whole dBm within the radio's range
+  #   low: 23
+  #   medium: 27
+  # max_dbm: 30                 # optional cap for high/max and numeric requests (licence or
+  #                             # datasheet limit; the radio's regulatory domain may allow more)
+  # Runtime changes: ./doodle-up <config> tx-power <value>  (`startup` returns to the value above),
+  # or over ROS: ros2 param set /<namespace>/radio tx_power <value>  (any value except off).
+  # Requests outside the radio's supported range are rejected — the radio itself clamps silently.
+
+# Health reporting: diagnostic_msgs/DiagnosticArray on /diagnostics (docs/SERVICE_HEALTH.md;
+# components and keys in docs/PLAN.md).
+# health:
+#   interval_s: 1               # diagnostic heartbeat period
+#   poll_interval_s: 5          # radio polling period
+#   stale_after_s: 15           # observation validity
+#   limits:                     # metric -> warn_above/warn_below/error_above/error_below
+#     links.stations: {warn_below: 1}     # e.g. warn when no peer is in range
+#     rf.noise_dbm: {warn_above: -85}     # e.g. warn on a noisy channel
+
+# Zenoh session settings (only with RMW_IMPLEMENTATION=rmw_zenoh_cpp); same block as the other rig
+# ROS services. `overrides` (nested config flattened to path=json pairs) is the useful part here;
+# shared_memory is accepted for uniformity but has no effect for this service's small messages.
+# zenoh:
+#   overrides:
+#     connect:
+#       endpoints: ["tcp/localhost:7447"]
+
+# Deployment/launcher environment (not instance-YAML fields):
+#   VEHICLE_ID              vehicle identity for health reporting (rig supplies it)
+#   ROS_DOMAIN_ID           default 0
+#   RMW_IMPLEMENTATION      default rmw_fastrtps_cpp; rmw_zenoh_cpp for native Zenoh routing
+#   ZENOH_CONFIG_OVERRIDE   optional path=json;... pairs applied before the config's zenoh block
+#   DOODLE_IMAGE            full image override; else [RIG_IMAGE_REGISTRY/]doodle_radio:RIG_IMAGE_TAG
+#   COMPOSE_PROJECT_NAME    rig-supplied project; standalone defaults to service_name
+#   DOODLE_SETTLE_TIMEOUT   seconds `up -d` waits for the target power (default 120)
+#   DOODLE_PYTHON           launcher Python interpreter (default python3; requires PyYAML)

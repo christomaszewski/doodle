@@ -1,0 +1,124 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  ROS_DISTRO: lyrical
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Build the runtime image (no push: `rig build` / tools/build_image.sh
+  # publishes), then run the supervisor, radio-client and ROS suites inside it so
+  # the INSTALLED entrypoints (and real rclpy) are what gets exercised.
+  # ---------------------------------------------------------------------------
+  build-image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.runtime
+          push: false
+          load: true
+          tags: doodle_radio:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            ROS_DISTRO=${{ env.ROS_DISTRO }}
+      - name: Test installed supervisor against the simulated radio
+        run: |
+          docker run --rm --init --network none \
+            -e DOODLE_TEST_ENTRYPOINT_DIR=/usr/local/bin \
+            -v "$PWD:/workspace:ro" -w /workspace/tests doodle_radio:ci \
+            python3 -m unittest test_radio_api test_supervisor test_service test_health \
+              test_health_ros -v
+
+  # ---------------------------------------------------------------------------
+  # rig launcher contract, executable (see rigging.yaml): `rig certify` renders
+  # `doodle-up <config> config` under a poisoned fleet env and checks project
+  # name, registry/tag agreement, ROS env passthrough, determinism, identity and
+  # `status` output.
+  # ---------------------------------------------------------------------------
+  certify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: christomaszewski/rig
+          path: .rig
+      - run: python3 -m pip install --user pyyaml
+      - name: rig certify (launcher contract)
+        run: ./.rig/rig certify --repo . --config sensors/doodle.example.yaml
+
+  # ---------------------------------------------------------------------------
+  # rig build contract (see rigging.yaml build:): build_image.sh must forward
+  # the rig build env into the docker argv. A stub `docker` records the argv.
+  # ---------------------------------------------------------------------------
+  build-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: build_image.sh forwards the rig build env
+        run: |
+          mkdir -p "${RUNNER_TEMP}/stub"
+          printf '#!/usr/bin/env bash\necho "docker $*" >> "${DOCKER_ARGV_LOG}"\n' \
+            > "${RUNNER_TEMP}/stub/docker"
+          chmod +x "${RUNNER_TEMP}/stub/docker"
+          export PATH="${RUNNER_TEMP}/stub:${PATH}"
+          export DOCKER_ARGV_LOG="${RUNNER_TEMP}/argv.log"
+          must_fail() { if "$@" >/dev/null 2>&1; then echo "expected failure: $*"; exit 1; fi; }
+
+          : > "${DOCKER_ARGV_LOG}"
+          env -u RIG_BUILD_NO_CACHE -u RIG_BASE_IMAGE \
+            tools/build_image.sh reg.example:5000 vtest
+          grep -q -- '-t reg.example:5000/doodle_radio:vtest' "${DOCKER_ARGV_LOG}"
+          grep -q -- '--build-arg ROS_DISTRO=lyrical' "${DOCKER_ARGV_LOG}"
+          grep -q -- '--build-arg BASE_IMAGE=ros:lyrical-ros-core' "${DOCKER_ARGV_LOG}"
+          must_fail grep -q -- '--no-cache' "${DOCKER_ARGV_LOG}"
+          must_fail grep -q -- '--pull' "${DOCKER_ARGV_LOG}"
+
+          : > "${DOCKER_ARGV_LOG}"
+          RIG_BUILD_NO_CACHE=1 ROS_DISTRO=zephyrous \
+            RIG_BASE_IMAGE=reg.example:5000/fleet-ros:v9 \
+            tools/build_image.sh reg.example:5000 vtest
+          grep -q -- '--no-cache --pull' "${DOCKER_ARGV_LOG}"
+          grep -q -- '--build-arg ROS_DISTRO=zephyrous' "${DOCKER_ARGV_LOG}"
+          grep -q -- '--build-arg BASE_IMAGE=reg.example:5000/fleet-ros:v9' "${DOCKER_ARGV_LOG}"
+
+  # ---------------------------------------------------------------------------
+  # Everything without a radio or ROS: config validation, power levels, the
+  # radio client (HTTP + TLS), the supervisor process, launcher contracts and a
+  # real `docker compose config` render.
+  # ---------------------------------------------------------------------------
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 -m pip install --user pyyaml
+      - run: python3 -m unittest discover -s tests -v
+
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck launcher + build script + entrypoints
+        run: shellcheck doodle-up tools/build_image.sh docker/entrypoints/*.sh

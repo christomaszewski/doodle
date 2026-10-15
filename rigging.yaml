@@ -1,0 +1,38 @@
+# Descriptor for the "rig" vehicle-level orchestrator: how to invoke this service's per-radio
+# launcher. Descriptive metadata ONLY -- this repo does NOT depend on rig; rig depends on this repo
+# (one-way). rig invokes:  <launcher> <config> <mapped-verb>   e.g.  doodle-up <config> up -d
+service: doodle
+launcher: doodle-up
+verbs:
+  up: "up -d"        # waits until the radio is at its startup power (or reports why not)
+  down: "down"       # the supervisor applies tx_power.shutdown on SIGTERM; failure => nonzero
+  status: "ps"       # rig may append `--format json` to parse `docker compose ps`
+  logs: "logs"
+  config: "config"   # rendered compose; carries the password FILE PATH, never the password
+  # No operational-state trio (standby/activate/state) in v1: a fleet-wide standby must not
+  # silently lower the power of the link operators may be using. Runtime changes go through the
+  # launcher's own `tx-power` verb.
+ros_distro: lyrical
+
+# Example config `rig init` / `rig fetch` scaffold new instances from.
+examples:
+  - sensors/doodle.example.yaml
+
+# rig's BUILD phase: `rig build` runs <command> <registry> [tag] (cwd = this repo). `rig certify`
+# checks the compose pulls exactly these images from RIG_IMAGE_REGISTRY as :RIG_IMAGE_TAG.
+build:
+  command: tools/build_image.sh
+  images: [doodle_radio]
+
+# No `msgs:` block: the service uses only diagnostic_msgs and rcl_interfaces (the tx_power
+# parameter), which ros-core and the fleet-ros base already carry. No host ports (it is an HTTPS
+# client of the radio) and no external volumes (runtime requests live in the container).
+
+# Files rig vendors onto the vehicle to run this service. The runtime is the published image, so
+# no build context belongs here. render_config.py imports doodle_config.py (one validator for
+# launcher and container).
+launch_surface:
+  - doodle-up
+  - tools/render_config.py
+  - docker/entrypoints/doodle_config.py
+  - docker/compose/compose.deploy.yaml

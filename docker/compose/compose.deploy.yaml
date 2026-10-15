@@ -1,0 +1,40 @@
+# Deployment compose for ONE radio — parameterized and launched by `doodle-up`, which validates the
+# config and exports the variables below. Run it via the launcher, not directly.
+#
+# Multi-instance safe: no container_name; identity comes from the compose project (the rig-injected
+# COMPOSE_PROJECT_NAME, or doodle_<name> standalone). Health comes from the image's HEALTHCHECK
+# (the radio is reachable and at its target power, and diagnostics are publishing).
+services:
+  radio:
+    # Image precedence: DOODLE_IMAGE (full override) wins; else the rig fleet policy —
+    # RIG_IMAGE_REGISTRY prefixed onto doodle_radio, pulled as :RIG_IMAGE_TAG (what `rig build`
+    # pushed); else the bare local doodle_radio:latest (standalone default).
+    image: ${DOODLE_IMAGE:-${RIG_IMAGE_REGISTRY:+${RIG_IMAGE_REGISTRY}/}doodle_radio:${RIG_IMAGE_TAG:-latest}}
+    network_mode: host          # reach the radio's management address + expose ROS 2 on the host
+    # No ipc: host / memlock: this service publishes small diagnostics, so Zenoh shared memory
+    # buys nothing and the container needs no extra privileges.
+    restart: unless-stopped
+    init: true
+    # Maximum failure budget, not a fixed wait: finish an in-flight change, apply the shutdown
+    # power (or RF off) and confirm it.
+    stop_grace_period: 60s
+    environment:
+      ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-0}
+      RMW_IMPLEMENTATION: ${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}
+      ZENOH_CONFIG_OVERRIDE: ${ZENOH_CONFIG_OVERRIDE:-}
+      # Rendered from the config's `zenoh:` block; appended under rmw_zenoh_cpp only.
+      DOODLE_ZENOH_OVERRIDE: ${DOODLE_ZENOH_OVERRIDE:-}
+      DOODLE_NAME: ${DOODLE_NAME:?run via doodle-up}
+      DOODLE_NAMESPACE: ${DOODLE_NAMESPACE:?run via doodle-up}
+      # Validated connection / tx_power / health settings (JSON). No secrets.
+      DOODLE_CONFIG: ${DOODLE_CONFIG:?run via doodle-up}
+      VEHICLE_ID: ${VEHICLE_ID:-}
+    secrets:
+      - source: radio_password
+        target: radio_password    # /run/secrets/radio_password
+    command: ["python3", "/usr/local/bin/supervisor.py", "serve"]
+
+# The radio's API password, mounted from a host file. Only the path is rendered into the compose.
+secrets:
+  radio_password:
+    file: ${DOODLE_PASSWORD_FILE:?run via doodle-up}
