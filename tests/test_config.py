@@ -15,7 +15,7 @@ import power  # noqa: E402
 
 def base(**tx_power):
     return {"name": "mesh", "connection": {"ubus": {"host": "10.223.18.52",
-                                                    "password_file": "mesh.password"}},
+                                                    "password": "Config-Test-Pw"}},
             "tx_power": tx_power}
 
 
@@ -54,22 +54,24 @@ class ConfigTests(unittest.TestCase):
 
     def test_connection_rules(self):
         config = dc.load(base())
-        self.assertEqual(config["connection"]["password_file"], "mesh.password")
+        self.assertEqual(config["connection"]["password"], "Config-Test-Pw")
         pin = ":".join(["AB"] * 32)
         config = dc.load({**base(), "connection": {"ubus": {
-            "host": "radio.local", "password_file": "/etc/p", "tls_fingerprint_sha256": pin}}})
+            "host": "radio.local", "password": "p", "tls_fingerprint_sha256": pin}}})
         self.assertEqual(config["connection"]["tls_fingerprint_sha256"], "ab" * 32)
-        bad_blocks = [{"password_file": "p"},                                  # no host
-                      {"host": "h"},                                           # no password file
-                      {"host": "h; rm -rf /", "password_file": "p"},
-                      {"host": "h", "password_file": "$HOME/p"},
-                      {"host": "h", "password_file": "p", "scheme": "ftp"},
-                      {"host": "h", "password_file": "p", "port": 70000},
-                      {"host": "h", "password_file": "p", "device": "wlan0 up"},
-                      {"host": "h", "password_file": "p", "tls_fingerprint_sha256": "abc"},
-                      {"host": "h", "password_file": "p", "scheme": "http",
+        bad_blocks = [{"password": "p"},                                       # no host
+                      {"host": "h"},                                           # no password
+                      {"host": "h", "password": ""},
+                      {"host": "h", "password": 12345},                        # unquoted YAML
+                      {"host": "h", "password": "a\nb"},
+                      {"host": "h; rm -rf /", "password": "p"},
+                      {"host": "h", "password": "p", "scheme": "ftp"},
+                      {"host": "h", "password": "p", "port": 70000},
+                      {"host": "h", "password": "p", "device": "wlan0 up"},
+                      {"host": "h", "password": "p", "tls_fingerprint_sha256": "abc"},
+                      {"host": "h", "password": "p", "scheme": "http",
                        "tls_fingerprint_sha256": "ab" * 32},
-                      {"host": "h", "password_file": "p", "password": "inline"}]
+                      {"host": "h", "password": "p", "password_file": "/etc/p"}]
         for block in bad_blocks:
             with self.assertRaises(ConfigError, msg=block):
                 dc.load({"connection": {"ubus": block}})
@@ -86,12 +88,26 @@ class ConfigTests(unittest.TestCase):
         config = dc.load(base(startup="medium", shutdown=False))
         text = dc.runtime_json(config)
         self.assertNotIn("password", text)
+        self.assertNotIn("Config-Test-Pw", text)
         self.assertEqual(text, dc.runtime_json(dc.load(base(startup="medium", shutdown=False))))
         runtime = dc.runtime(json.loads(text))
         self.assertEqual(runtime["tx_power"]["shutdown"], "off")
-        self.assertNotIn("password_file", runtime["connection"])
+        self.assertNotIn("password", runtime["connection"])
         with self.assertRaises(ConfigError):
             dc.runtime({**json.loads(text), "extra": 1})
+        leaked = json.loads(text)
+        leaked["connection"]["password"] = "x"
+        with self.assertRaises(ConfigError):
+            dc.runtime(leaked)
+
+    def test_rig_var_markers_validate_and_are_detected(self):
+        config = dc.load({**base(), "connection": {"ubus": {
+            "host": "h", "password": "{{doodle_radio_password}}"}}})
+        self.assertEqual(dc.unresolved_password_var(config), "doodle_radio_password")
+        self.assertIsNone(dc.unresolved_password_var(dc.load(base())))
+        with self.assertRaises(ConfigError) as caught:
+            dc.load({**base(), "connection": {"ubus": {"host": "h", "password": 8675309}}})
+        self.assertNotIn("8675309", str(caught.exception))
 
     def test_health_and_zenoh_blocks(self):
         config = dc.load({**base(), "health": {"poll_interval_s": 2},

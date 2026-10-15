@@ -40,9 +40,16 @@ the Setup Wizard. Do not restore a backup taken on older firmware.
 - Web UI and API: `user` / `DoodleSmartRadio`. Change it at once — the API is reachable from the
   whole mesh and the account has full access.
 - SSH: `root`, no password after a reset. Set one with `passwd`.
-- The service reads the API password from the host file named by
-  `connection.ubus.password_file` (keep it `chmod 600`), mounted into the container as a compose
-  secret. Only the path appears in the rendered compose or a `rig bake` artifact.
+- The service needs only the `user` password. In the config, set
+  `connection.ubus.password: "{{doodle_radio_password}}"` and provision the value once per vehicle
+  with `sudo rig provision --var doodle_radio_password='<password>'` (stored in
+  `/etc/rig/vehicle.local.yaml`; `rig bake` never reads it). Standalone, put the password itself
+  in a config kept out of git. The launcher writes it to `var/run/<name>.radio_password` (0600)
+  for the container's compose secret; it never appears in the rendered compose or the container
+  environment, and `down` deletes it.
+- At the time of writing, rig writes `/etc/rig/vehicle.local.yaml` and the filled-in config
+  (`var/rendered/<name>.yaml` in the deployment) with default permissions, so other local users
+  on the vehicle computer may be able to read the password there.
 - The Setup Wizard stores its command line, including the mesh key after `-k`, in
   `uci get hotspot-wizard`. Config backups (`sysupgrade -b`) contain the mesh key and the
   API password in plain text.

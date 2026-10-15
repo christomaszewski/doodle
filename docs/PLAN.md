@@ -13,7 +13,7 @@ Radio facts this plan depends on are in [RADIO_API.md](RADIO_API.md); radio prep
 | Topic | Decision |
 |---|---|
 | Firmware | 2025-06 and later; tested on 2026-03.1 |
-| API | JSON-RPC over HTTPS (`/ubus`) as `user`; password from a host file mounted as a compose secret — only its path appears in the rendered compose or a `rig bake` artifact |
+| API | JSON-RPC over HTTPS (`/ubus`) as `user` (never root). The password is a config value — under rig a vehicle-local var, `"{{doodle_radio_password}}"`, provisioned into `/etc/rig/vehicle.local.yaml` — that the launcher hands to the container as a compose secret, never in the rendered compose or a `rig bake` artifact |
 | Writes | Live only (`iw … set txpower fixed`, `network.wireless down/up`). No UCI commits, nothing written to flash |
 | Operational-state verbs | Not in v1 (`standby`/`activate`/`state` are not declared in `rigging.yaml`) |
 | Default startup/shutdown | `unchanged` when omitted — the service only observes |
@@ -36,7 +36,7 @@ connection:
     host: 10.223.18.52
     scheme: https
     username: user
-    password_file: /etc/doodle/mesh.password
+    password: "{{doodle_radio_password}}"   # rig vehicle-local var
     tls_fingerprint_sha256: ""
     device: wlan0
     uci_radio: radio0

@@ -200,6 +200,9 @@ class Server(http.server.ThreadingHTTPServer):
         self.connections = set()
         self.close_after_reply = False
 
+    def handle_error(self, request, client_address):
+        pass  # clients that hang up mid-handshake (TLS pin tests) are expected
+
     def __enter__(self):
         self.thread = threading.Thread(target=self.serve_forever, daemon=True)
         self.thread.start()

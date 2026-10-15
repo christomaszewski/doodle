@@ -30,11 +30,11 @@ class ServiceTests(unittest.TestCase):
 
     def start(self, **tx_power):
         tmp = Path(self.tmp.name)
-        secret = tmp / "radio_password"
-        secret.write_text(self.radio.password + "\n")
+        secret = tmp / "radio_password"  # what the launcher writes and compose mounts
+        secret.write_text(self.radio.password)
         config = doodle_config.load({"name": "mesh", "tx_power": tx_power, "connection": {"ubus": {
             "host": "127.0.0.1", "scheme": "http", "port": self.server.server_address[1],
-            "password_file": str(secret)}}})
+            "password": self.radio.password}}})
         self.env = dict(os.environ, DOODLE_CONFIG=doodle_config.runtime_json(config),
                         DOODLE_SECRET_FILE=str(secret),
                         DOODLE_CONTROL_SOCKET=str(tmp / "control.sock"),

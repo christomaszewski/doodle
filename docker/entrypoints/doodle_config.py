@@ -13,13 +13,16 @@ HOST = re.compile(r"^[A-Za-z0-9.:\[\]-]+$")
 DEVICE = re.compile(r"^[A-Za-z0-9_.-]{1,15}$")
 USERNAME = re.compile(r"^[A-Za-z0-9_.-]+$")
 FINGERPRINT = re.compile(r"^[0-9a-f]{64}$")
+# A rig `{{var}}` marker that was never filled in (rig itself errors on unknown vars at render
+# time; this catches standalone use of a rig-style config).
+RIG_MARKER = re.compile(r"\{\{\s*([a-z][a-z0-9_]*)\s*\}\}")
 
 LEVELS = ("standby", "low", "medium", "high", "max")
 KEYWORDS = ("unchanged", "off")
 # Sanity bounds only; the radio's own supported list decides at runtime.
 DBM_MIN, DBM_MAX = 0, 40
 
-UBUS_KEYS = {"host", "port", "scheme", "username", "password_file", "tls_fingerprint_sha256",
+UBUS_KEYS = {"host", "port", "scheme", "username", "password", "tls_fingerprint_sha256",
              "device", "uci_radio"}
 TX_POWER_KEYS = {"startup", "shutdown", "levels", "max_dbm"}
 HEALTH_KEYS = {"interval_s", "poll_interval_s", "stale_after_s", "limits"}
@@ -81,7 +84,8 @@ def power_value(value, where="tx_power"):
 
 
 def connection(raw, *, runtime=False):
-    """`runtime` is the container's view: the host-side password_file path is not passed in."""
+    """`runtime` is the container's view: the password is not part of it (it arrives as a
+    compose secret written by the launcher)."""
     raw = _mapping(raw, "connection")
     kind = str(raw.get("type") or "ubus")
     if kind != "ubus":
@@ -100,15 +104,16 @@ def connection(raw, *, runtime=False):
     username = str(block.get("username") or "user")
     if not USERNAME.match(username):
         raise ConfigError("connection.ubus.username has invalid characters")
-    password_file = block.get("password_file")
+    password = block.get("password")
     if runtime:
-        if password_file is not None:
-            raise ConfigError("password_file is host-side only")
-    elif not isinstance(password_file, str) or not password_file.strip():
-        raise ConfigError("connection.ubus.password_file is required (a file holding the radio's "
-                          "API password; see docs/RADIO_SETUP.md)")
-    elif any(c in password_file for c in "$\n"):
-        raise ConfigError("connection.ubus.password_file must not contain '$' or newlines")
+        if password is not None:
+            raise ConfigError("the password must not be part of DOODLE_CONFIG")
+    elif not isinstance(password, str) or not password:
+        # Never echo the value: only its type.
+        raise ConfigError("connection.ubus.password is required and must be a string (quote it "
+                          "in YAML; under rig use a var such as \"{{doodle_radio_password}}\")")
+    elif any(ord(c) < 32 or ord(c) == 127 for c in password):
+        raise ConfigError("connection.ubus.password must not contain control characters")
     fingerprint = str(block.get("tls_fingerprint_sha256") or "").replace(":", "").lower()
     if fingerprint and not FINGERPRINT.match(fingerprint):
         raise ConfigError("connection.ubus.tls_fingerprint_sha256 must be 64 hex digits")
@@ -122,7 +127,7 @@ def connection(raw, *, runtime=False):
               "device": device,
               "uci_radio": ident("connection.ubus.uci_radio", block.get("uci_radio") or "radio0")}
     if not runtime:
-        result["password_file"] = password_file
+        result["password"] = password
     return result
 
 
@@ -254,8 +259,14 @@ def runtime(raw):
 
 
 def runtime_json(config):
-    """Deterministic DOODLE_CONFIG for a validated config (password_file stays host-side)."""
-    conn = {k: v for k, v in config["connection"].items() if k != "password_file"}
+    """Deterministic DOODLE_CONFIG for a validated config. Never contains the password."""
+    conn = {k: v for k, v in config["connection"].items() if k != "password"}
     return json.dumps({"connection": conn, "tx_power": config["tx_power"],
                        "health": config["health"]}, sort_keys=True, separators=(",", ":"),
                       allow_nan=False)
+
+
+def unresolved_password_var(config):
+    """The rig var name if the password is still an unfilled `{{var}}` marker, else None."""
+    match = RIG_MARKER.search(config["connection"]["password"])
+    return match.group(1) if match else None

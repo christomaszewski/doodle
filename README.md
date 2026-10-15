@@ -16,7 +16,7 @@ supervisor. Health reporting (Phase 3) is next.
 | `tools/render_config.py` + `docker/entrypoints/doodle_config.py` | One validator for the launcher and the container |
 | `docker/entrypoints/supervisor.py` | The only writer: applies the target, re-applies it after radio reboots and RF toggles, applies the shutdown value |
 | `docker/entrypoints/radio_api.py` | The radio's ubus JSON-RPC API over HTTPS; see [docs/RADIO_API.md](docs/RADIO_API.md) |
-| `docker/compose/compose.deploy.yaml` | One container per radio; the password arrives as a compose secret |
+| `docker/compose/compose.deploy.yaml` | One container per radio; the password arrives as a compose secret the launcher writes |
 | `rigging.yaml` | Tells rig how to drive `doodle-up` |
 
 Every change is live: nothing is written to the radio's flash, so a radio power cycle always
@@ -30,9 +30,11 @@ and a strong password for its `user` login.
 ```bash
 docker build -f docker/Dockerfile.runtime -t doodle_radio:latest .
 
-mkdir -p radios
-cp sensors/doodle.example.yaml radios/mesh.yaml   # set host, password_file, tx_power
-printf '%s' '<api password>' > radios/mesh.password && chmod 600 radios/mesh.password
+mkdir -p radios                                   # gitignored
+cp sensors/doodle.example.yaml radios/mesh.yaml   # set host, password, tx_power
+# Standalone: put the `user` password itself in radios/mesh.yaml.
+# Under rig: keep password: "{{doodle_radio_password}}" and run once per vehicle
+#   sudo rig provision --var doodle_radio_password='<password>'
 
 ./doodle-up radios/mesh.yaml up -d        # waits until the startup power is applied
 ./doodle-up radios/mesh.yaml tx-power     # {"target": ..., "tx_power_dbm": ..., "converged": ...}

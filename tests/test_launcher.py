@@ -40,9 +40,7 @@ class LauncherTests(unittest.TestCase):
             shutil.copy2(ROOT / name, target)
         self.config = self.root / "radios/mesh.yaml"
         self.config.parent.mkdir()
-        self.password_file = self.config.parent / "mesh.password"
-        self.password_file.write_text(PASSWORD + "\n")
-        self.password_file.chmod(0o600)
+        self.secret = self.root / "var/run/mesh.radio_password"
         self.write_config()
         bin_dir = self.root / "bin"
         bin_dir.mkdir()
@@ -54,9 +52,9 @@ class LauncherTests(unittest.TestCase):
         self.env.update(PATH=f"{bin_dir}:{self.env['PATH']}", ARGV_LOG=str(self.argv),
                         ENV_LOG=str(self.envlog), DOODLE_SETTLE_TIMEOUT="2")
 
-    def write_config(self, **overrides):
+    def write_config(self, password=PASSWORD, **overrides):
         doc = yaml.safe_load((ROOT / "sensors/doodle.example.yaml").read_text())
-        doc["connection"]["ubus"]["password_file"] = "mesh.password"  # relative to the config
+        doc["connection"]["ubus"]["password"] = password
         doc.update(overrides)
         self.config.write_text(yaml.safe_dump(doc))
 
@@ -68,12 +66,13 @@ class LauncherTests(unittest.TestCase):
     def calls(self):
         return self.argv.read_text() if self.argv.exists() else ""
 
-    def test_config_carries_the_password_path_never_the_password(self):
+    def test_config_carries_the_secret_path_never_the_password(self):
         result = self.run_launcher("config")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "")  # fake docker printed nothing; launcher chatter → stderr
+        self.assertFalse(self.secret.exists())  # only creating a container writes it
         env = self.envlog.read_text()
-        self.assertIn(f"DOODLE_PASSWORD_FILE={self.password_file}", env)
+        self.assertIn(f"DOODLE_PASSWORD_FILE={self.secret}", env)
         self.assertIn("COMPOSE_PROJECT_NAME=doodle_mesh", env)
         self.assertIn("DOODLE_NAMESPACE=/mesh", env)
         self.assertNotIn(PASSWORD, env)
@@ -91,22 +90,27 @@ class LauncherTests(unittest.TestCase):
             self.assertIn("render_config:", result.stderr)
             self.assertEqual(set(self.calls().splitlines()), {"docker compose version"})
 
-    def test_up_needs_a_readable_password_file_and_warns_when_shared(self):
-        self.password_file.unlink()
-        result = self.run_launcher("up", "-d")
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("password file not readable", result.stderr)
-        self.assertNotIn(" up", self.calls())
-        self.password_file.write_text(PASSWORD)
-        self.password_file.chmod(0o644)
+    def test_up_writes_the_secret_privately_and_down_removes_it(self):
         result = self.run_launcher("up", "-d")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("readable by other users", result.stderr)
+        self.assertEqual(self.secret.read_text(), PASSWORD)
+        self.assertEqual(self.secret.stat().st_mode & 0o777, 0o600)
         self.assertNotIn(PASSWORD, self.envlog.read_text())
-        # Inspection and teardown work without the file.
-        self.password_file.unlink()
-        for verb in ("status", "logs", "down", "config"):
-            self.assertEqual(self.run_launcher(verb).returncode, 0, verb)
+        self.assertNotIn(PASSWORD, result.stdout + result.stderr)
+        self.write_config(password="Rotated-Password-2")
+        self.assertEqual(self.run_launcher("up", "-d").returncode, 0)
+        self.assertEqual(self.secret.read_text(), "Rotated-Password-2")
+        self.assertEqual(self.run_launcher("down").returncode, 0)
+        self.assertFalse(self.secret.exists())
+
+    def test_unfilled_rig_var_renders_but_never_starts(self):
+        self.write_config(password="{{doodle_radio_password}}")
+        self.assertEqual(self.run_launcher("config").returncode, 0)  # bake/certify still render
+        result = self.run_launcher("up", "-d")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("sudo rig provision --var doodle_radio_password=", result.stderr)
+        self.assertNotIn(" up", self.calls())
+        self.assertFalse(self.secret.exists())
 
     def test_tx_power_never_creates_a_container(self):
         result = self.run_launcher("tx-power")
@@ -155,10 +159,9 @@ class ComposeRenderTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             config = Path(tmp, "mesh.yaml")
             doc = yaml.safe_load((ROOT / "sensors/doodle.example.yaml").read_text())
-            doc["connection"]["ubus"]["password_file"] = "mesh.password"
+            doc["connection"]["ubus"]["password"] = PASSWORD
             doc["tx_power"] = {"startup": "medium", "shutdown": False}
             config.write_text(yaml.safe_dump(doc))
-            Path(tmp, "mesh.password").write_text(PASSWORD)
             env = {k: v for k, v in os.environ.items()
                    if not k.startswith(("DOODLE_", "RIG_", "COMPOSE_"))}
             env.update(RIG_IMAGE_REGISTRY="registry.example:5000", RIG_IMAGE_TAG="v1",
@@ -176,7 +179,8 @@ class ComposeRenderTests(unittest.TestCase):
             runtime = json.loads(radio["environment"]["DOODLE_CONFIG"])
             self.assertEqual(runtime["tx_power"]["shutdown"], "off")
             self.assertEqual(compose["secrets"]["radio_password"]["file"],
-                             str(Path(tmp, "mesh.password").resolve()))
+                             str(ROOT / "var/run/mesh.radio_password"))
+            self.assertNotIn(PASSWORD, json.dumps(radio["environment"]))
 
 
 if __name__ == "__main__":

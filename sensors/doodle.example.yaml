@@ -16,10 +16,16 @@ connection:
     # scheme: https             # https (default; the radio uses a self-signed certificate) | http
     # port: 443                 # default for the scheme
     # username: user            # firmware 2025-06+ API login; do not use root
-    password_file: /etc/doodle/mesh.password
-    # Required. Host file containing only the API password (chmod 600). Relative paths are
-    # relative to this config file. Only the path reaches the rendered compose; the container
-    # reads the password from /run/secrets/radio_password.
+    password: "{{doodle_radio_password}}"
+    # Required: the API password of the radio's `user` login (root is never used). Under rig,
+    # keep it out of this file: reference a vehicle-local var as above and provision it once per
+    # vehicle with
+    #   sudo rig provision --var doodle_radio_password='<password>'
+    # rig fills it in on the vehicle from /etc/rig/vehicle.local.yaml, and `rig bake` never reads
+    # that file, so artifacts carry only the marker. Standalone, put the password itself here and
+    # keep the config out of git. Quote it: YAML would turn 012345 into a number.
+    # The launcher writes it to var/run/<name>.radio_password (0600) when it creates the
+    # container; it never appears in the rendered compose or the container's environment.
     # tls_fingerprint_sha256: ""  # optional SHA-256 pin of the radio's certificate (64 hex
     #                             # digits, colons allowed). Empty = encrypted but not
     #                             # authenticated. A renewed radio certificate changes it.

@@ -1,6 +1,6 @@
 __pycache__/
 *.pyc
 .pytest_cache/
-# local instance configs and secrets
+# launcher state (generated secrets live here) and local instance configs
+var/
 radios/
-*.password

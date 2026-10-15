@@ -31,18 +31,20 @@ if ! docker compose version >/dev/null 2>&1; then
   exit 1
 fi
 
-# config -> SERVICE / NAME / NAMESPACE (plain tokens) and PASSWORD_FILE / DOODLE_CONFIG /
-# ZENOH_OVERRIDE (shell-quoted by the renderer, safe for this eval). Invalid config exits here,
-# before any container is touched.
+# config -> SERVICE / NAME / NAMESPACE (plain tokens) and DOODLE_CONFIG / ZENOH_OVERRIDE
+# (shell-quoted by the renderer, safe for this eval). Never the password. Invalid config exits
+# here, before any container is touched.
 ENV_LINES="$("$PYTHON" "$REPO/tools/render_config.py" "$CONFIG_ABS")"
 eval "$(printf '%s\n' "$ENV_LINES" | sed 's/^/export /')"
 
 export DOODLE_NAME="$NAME"
 export DOODLE_NAMESPACE="$NAMESPACE"
 export DOODLE_ZENOH_OVERRIDE="$ZENOH_OVERRIDE"
-# Only the PATH reaches compose (as a `secrets:` file). The password itself never appears in the
-# rendered compose, so `config` output and `rig bake` artifacts carry no secret.
-export DOODLE_PASSWORD_FILE="$PASSWORD_FILE"
+# The password from the config is written to this file (0600) only when a container is created,
+# and compose mounts it as a secret. Only the PATH appears in the rendered compose, so `config`
+# output and `rig bake` artifacts carry no secret.
+SECRET_FILE="$REPO/var/run/${NAME}.radio_password"
+export DOODLE_PASSWORD_FILE="$SECRET_FILE"
 export DOODLE_CONFIG
 
 # rig owns the compose project name (it exports COMPOSE_PROJECT_NAME per call); honor it when
@@ -78,18 +80,11 @@ if [ "${ARGS[0]}" = "tx-power" ]; then
   exec docker compose "${FILES[@]}" exec -T radio /usr/local/bin/radioctl.sh set "${ARGS[1]}"
 fi
 
-# --- creating a container needs the password file to exist -----------------------------------------
+# --- creating a container: write the password secret from the config ----------------------------
+# The renderer writes the file itself, so the password never passes through this shell.
 case "${ARGS[0]}" in
   up|create|run)
-    if [ ! -r "$DOODLE_PASSWORD_FILE" ]; then
-      echo "doodle-up: radio password file not readable: $DOODLE_PASSWORD_FILE" \
-           "(connection.ubus.password_file; see docs/RADIO_SETUP.md)" >&2
-      exit 1
-    fi
-    if ! "$PYTHON" -c 'import os, sys; sys.exit(os.stat(sys.argv[1]).st_mode & 0o077 != 0)' \
-         "$DOODLE_PASSWORD_FILE"; then
-      echo "doodle-up: warning: $DOODLE_PASSWORD_FILE is readable by other users (chmod 600 it)" >&2
-    fi
+    "$PYTHON" "$REPO/tools/render_config.py" --write-secret "$SECRET_FILE" "$CONFIG_ABS"
     ;;
 esac
 
@@ -119,6 +114,7 @@ if [ "${ARGS[0]}" = "down" ]; then
     done
   fi
   docker compose "${FILES[@]}" "${ARGS[@]}" || DOWN_EXIT_STATUS=1
+  rm -f "$SECRET_FILE"  # no container left to mount it
   exit "$DOWN_EXIT_STATUS"
 fi
 
