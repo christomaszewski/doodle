@@ -10,7 +10,7 @@ import unittest
 import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
-FILES = ("doodle-up", "tools/render_config.py", "docker/entrypoints/doodle_config.py",
+FILES = ("doodle-up", "tools/render_config.py", "tools/wait_ready.py", "docker/entrypoints/doodle_config.py",
          "docker/compose/compose.deploy.yaml", "sensors/doodle.example.yaml")
 PASSWORD = "Launcher-Test-Password-9"
 
@@ -22,7 +22,9 @@ case "$*" in
   "inspect --format"*) echo "${STOP_EXIT_CODE:-0}" ;;
   "logs --tail 40"*) echo 'shutdown log evidence' ;;
   *" ps -q radio"|*" ps -aq radio") [ "${RUNNING:-}" = 1 ] && echo container; exit 0 ;;
-  *"radioctl.sh status") printf '%s\n' "${FAKE_STATUS:-{\"converged\": true}}" ;;
+  *"radioctl.sh status"|*"radioctl.sh ready")
+    if [ -n "${FAKE_STATUS:-}" ]; then printf '%s\n' "$FAKE_STATUS";
+    else printf '%s\n' '{"converged": true}'; fi ;;
   *"radioctl.sh set "*) printf '{"set": "%s"}\n' "${@: -1}" ;;
 esac
 exit 0
@@ -50,7 +52,7 @@ class LauncherTests(unittest.TestCase):
         self.env = {k: v for k, v in os.environ.items()
                     if not k.startswith(("DOODLE_", "RIG_", "COMPOSE_"))}
         self.env.update(PATH=f"{bin_dir}:{self.env['PATH']}", ARGV_LOG=str(self.argv),
-                        ENV_LOG=str(self.envlog), DOODLE_SETTLE_TIMEOUT="2")
+                        ENV_LOG=str(self.envlog), DOODLE_SETTLE_TIMEOUT="2", DOODLE_CONNECT_TIMEOUT="2")
 
     def write_config(self, password=PASSWORD, **overrides):
         doc = yaml.safe_load((ROOT / "sensors/doodle.example.yaml").read_text())
@@ -133,8 +135,8 @@ class LauncherTests(unittest.TestCase):
     def test_up_detached_waits_for_the_target(self):
         result = self.run_launcher("up", "-d")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("radioctl.sh status", self.calls())
-        result = self.run_launcher("up", "-d", FAKE_STATUS='{"converged": false, "error": "x"}')
+        self.assertIn("radioctl.sh ready", self.calls())
+        result = self.run_launcher("up", "-d", FAKE_STATUS='{"reachable": true, "converged": false, "error": "x"}')
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("did not reach its target", result.stderr)
 

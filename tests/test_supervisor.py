@@ -54,6 +54,16 @@ class ControllerTests(unittest.TestCase):
         controller.status()
         self.assertEqual(self.radio.writes(), [])
 
+    def test_ready_is_cached_even_while_reconciliation_holds_lock(self):
+        controller = self.controller()
+        self.assertFalse(controller.ready()['reachable'])
+        controller.reconcile()
+        with controller.lock, patch.object(controller, 'observe', side_effect=AssertionError('network IO')):
+            result = controller.ready()
+        self.assertTrue(result['reachable'])
+        self.assertTrue(result['busy'])
+        self.assertTrue(result['converged'])
+
     def test_startup_level_is_applied_and_read_back(self):
         snapshot = self.controller(startup="medium").reconcile()
         self.assertEqual((snapshot["target_dbm"], snapshot["tx_power_dbm"]), (27, 27))

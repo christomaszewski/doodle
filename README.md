@@ -61,3 +61,19 @@ python3 -m unittest discover -s tests -v   # needs PyYAML; Docker Compose for th
 The suites run against a simulated radio (`tests/fake_radio.py`) whose replies follow the
 measured API. CI also builds the image, runs the supervisor and ROS suites inside it (real
 `/diagnostics` and parameter calls), and runs `rig certify`.
+
+## Portable builds and replay startup
+
+Detached startup allows 10 seconds for first radio reachability, then 120 seconds for power
+reconciliation. Set `DOODLE_CONNECT_TIMEOUT` or `DOODLE_SETTLE_TIMEOUT` in the launcher's environment
+to change those budgets. Status polling is bounded and reads the supervisor's cached `ready` response;
+it does not issue extra radio requests. A timeout returns failure and leaves background retries running.
+
+Rig replay omits this live radio service by default and keeps its recorded bag topics. Use
+`rig replay RUN --include-service doodle` (or `--live INSTANCE`) for deliberate live-radio replay.
+This needs the updated descriptor/launcher and a rebuilt image containing `radioctl.sh ready`.
+
+The build contract declares arm64 and amd64 support. Rig publishes a multiarch index; standalone
+`tools/build_image.sh REGISTRY TAG` retains host-native builds. `RIG_BUILD_NO_CACHE=1` adds
+`--no-cache --pull`. Run `rig certify --repo . --require-build-check` to verify build forwarding
+without building images (Bubblewrap on Linux, sandbox-exec on macOS).

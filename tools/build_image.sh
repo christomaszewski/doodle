@@ -19,10 +19,10 @@ REGISTRY="${1:?usage: build_image.sh <registry> [tag]}"
 TAG="${2:-latest}"
 IMAGE="${REGISTRY}/doodle_radio:${TAG}"
 
-docker build ${DOODLE_BUILD_PLATFORM:+--platform "${DOODLE_BUILD_PLATFORM}"} \
-  ${RIG_BUILD_NO_CACHE:+--no-cache} ${RIG_BUILD_NO_CACHE:+--pull} \
+. "$REPO/tools/rig-build.sh"
+if [ -n "${RIG_BUILD_PLATFORMS:-}" ]; then unset DOODLE_BUILD_PLATFORM; fi
+rig_build "$IMAGE" ${DOODLE_BUILD_PLATFORM:+--platform "${DOODLE_BUILD_PLATFORM}"} \
   --build-arg "ROS_DISTRO=${ROS_DISTRO:-lyrical}" \
   --build-arg "BASE_IMAGE=${RIG_BASE_IMAGE:-ros:${ROS_DISTRO:-lyrical}-ros-core}" \
-  -f "$REPO/docker/Dockerfile.runtime" -t "$IMAGE" "$REPO"
-docker push "$IMAGE"
+  -f "$REPO/docker/Dockerfile.runtime" "$REPO"
 echo "build_image.sh: pushed $IMAGE" >&2

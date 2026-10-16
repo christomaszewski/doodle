@@ -7,7 +7,7 @@ few seconds keeps the radio at its target across radio reboots, wifi restarts an
 SIGTERM applies tx_power.shutdown and confirms it. Every change is live (nothing is written to the
 radio's flash) and is read back. Diagnostics run beside it (health.py) and only read.
 
-  supervisor.py serve | status | set <value> | health
+  supervisor.py serve | status | ready | set <value> | health
 """
 import contextlib
 import fcntl
@@ -24,7 +24,7 @@ import time
 
 import doodle_config
 import power
-from radio_api import RadioAPI, RadioError
+from radio_api import RadioAPI, RadioError, AuthError, ReplyError
 
 LOG = logging.getLogger("doodle")
 SOCKET = os.environ.get("DOODLE_CONTROL_SOCKET", "/run/doodle/control.sock")
@@ -53,6 +53,7 @@ class Controller:
         self.observed_at = None  # monotonic time of the latest snapshot
         self.generation = 0      # increments with every snapshot (diagnostics sample id)
         self.diagnostics = "off"  # set by the ROS health monitor
+        self.reachable = False
         self._permissions_checked = False
         self._supported = (None, [])  # (frequency, txpowerlist) — re-read when the channel moves
         self.target = self._load_target()
@@ -90,6 +91,7 @@ class Controller:
             self.radio.require("observe")  # one clear message instead of per-call denials
             self._permissions_checked = True
         uptime = self.radio.system_info().get("uptime")
+        self.reachable = True
         if isinstance(uptime, int):
             if self.uptime is not None and uptime < self.uptime:
                 LOG.warning("radio rebooted (uptime %ss -> %ss); its saved settings are back",
@@ -139,7 +141,13 @@ class Controller:
         return snapshot
 
     def _record(self, observation, error=""):
-        self.snapshot = self._snapshot(self.target, observation, error)
+        kind = ("auth" if isinstance(error, AuthError) else
+                "config" if isinstance(error, (power.PowerError, ReplyError)) else
+                "transport" if isinstance(error, RadioError) else "")
+        self.snapshot = self._snapshot(self.target, observation, str(error))
+        if self.snapshot.get('detail') == 'target not applicable':
+            kind = 'config'
+        self.snapshot['error_kind'] = kind
         self.observed_at = self.clock()
         self.generation += 1
         return self.snapshot
@@ -157,10 +165,15 @@ class Controller:
             try:
                 self._record(self.observe())
             except RadioError as error:
-                self._record(None, str(error))
+                self._record(None, error)
             return dict(self.snapshot, busy=False, diagnostics=self.diagnostics)
         finally:
             self.lock.release()
+
+    def ready(self):
+        """Cached readiness: never acquire the radio lock or issue a network request."""
+        return dict(self.snapshot, reachable=self.reachable, diagnostics=self.diagnostics,
+                    busy=self.lock.locked())
 
     # --- changes --------------------------------------------------------------------------------
 
@@ -239,7 +252,7 @@ class Controller:
                     observation = self.observe()
                 except RadioError:
                     observation = None
-                return self._record(observation, str(error))
+                return self._record(observation, error)
         finally:
             self.lock.release()
 
@@ -316,6 +329,8 @@ class Handler(socketserver.StreamRequestHandler):
             controller = self.server.controller
             if message.get("command") == "status":
                 result = {"ok": True, **controller.status()}
+            elif message.get("command") == "ready":
+                result = {"ok": True, **controller.ready()}
             elif message.get("command") == "set":
                 result = {"ok": True, **controller.request(message.get("value"))}
             else:
@@ -434,6 +449,8 @@ def main(argv=None):
             serve()
         elif args == ["status"]:
             print(json.dumps(client("status", timeout=20)))
+        elif args == ["ready"]:
+            print(json.dumps(client("ready", timeout=1)))
         elif len(args) == 2 and args[0] == "set":
             print(json.dumps(client("set", args[1], timeout=LOCK_WAIT + RF_TIMEOUT + 30)))
         elif args == ["health"]:

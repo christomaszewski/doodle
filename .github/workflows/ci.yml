@@ -66,8 +66,9 @@ jobs:
           repository: christomaszewski/rig
           path: .rig
       - run: python3 -m pip install --user pyyaml
+      - run: sudo apt-get update && sudo apt-get install -y bubblewrap libseccomp2
       - name: rig certify (launcher contract)
-        run: ./.rig/rig certify --repo . --config sensors/doodle.example.yaml
+        run: ./.rig/rig certify --require-build-check --repo . --config sensors/doodle.example.yaml
 
   # ---------------------------------------------------------------------------
   # rig build contract (see rigging.yaml build:): build_image.sh must forward

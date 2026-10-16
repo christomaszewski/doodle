@@ -124,19 +124,8 @@ for a in "${ARGS[@]:1}"; do case "$a" in -d|--detach) DETACHED=1;; esac; done
 if [ "${ARGS[0]}" = "up" ] && [ -n "$DETACHED" ]; then
   echo "doodle-up: project=$COMPOSE_PROJECT_NAME namespace=$NAMESPACE" >&2
   docker compose "${FILES[@]}" "${ARGS[@]}"
-  SETTLE_BUDGET="${DOODLE_SETTLE_TIMEOUT:-120}"
-  DEADLINE=$((SECONDS + SETTLE_BUDGET))
-  while :; do
-    STATUS_JSON="$(docker compose "${FILES[@]}" exec -T radio /usr/local/bin/radioctl.sh status 2>/dev/null)" \
-      || STATUS_JSON=""
-    case "$STATUS_JSON" in *'"converged": true'*) exit 0 ;; esac
-    if [ "$SECONDS" -ge "$DEADLINE" ]; then
-      echo "doodle-up: radio did not reach its target within ${SETTLE_BUDGET}s" \
-           "(last status: ${STATUS_JSON:-unreachable}) — left up; check 'tx-power' / 'logs'" >&2
-      exit 1
-    fi
-    sleep 3
-  done
+  exec "$PYTHON" "$REPO/tools/wait_ready.py" docker compose "${FILES[@]}" \
+    exec -T radio /usr/local/bin/radioctl.sh ready
 fi
 
 echo "doodle-up: project=$COMPOSE_PROJECT_NAME namespace=$NAMESPACE" >&2

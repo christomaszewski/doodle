@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Client for the running supervisor, which owns every change to the radio.
 #   radioctl.sh status          status JSON on stdout
+#   radioctl.sh ready           cached readiness JSON; no radio requests
 #   radioctl.sh set <value>     standby|low|medium|high|max|off|<dBm>|startup|unchanged
 set -eo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
