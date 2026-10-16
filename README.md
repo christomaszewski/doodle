@@ -66,7 +66,8 @@ rig bake --tag v1                       # fleet artifact: carries {{doodle_radio
 The artifact's `vehicle.local.example.yaml` lists `doodle_radio_password` as required. On each
 vehicle, provision it once with the bundled `sudo ./provision.sh --id <N> --name <name> --var
 doodle_radio_password='<password>'` (or `sudo rig provision --var …` on a vehicle that is already
-provisioned), then `rig up`.
+provisioned), then `rig up`. Writing `vehicle.local.yaml` by hand instead, single-quote the
+password: unquoted, a leading `!` or `&` breaks the YAML for every rig command.
 
 Dev-machine commands that render configs (`rig doctor`, `rig config`, `rig certify`,
 `rig image audit`, `rig up`) need some value for the var. Give a placeholder for that command

@@ -23,7 +23,8 @@ connection:
     #   sudo rig provision --var doodle_radio_password='<password>'
     # rig fills it in on the vehicle from /etc/rig/vehicle.local.yaml, and `rig bake` never reads
     # that file, so artifacts carry only the marker. Standalone, put the password itself here and
-    # keep the config out of git. Quote it: YAML would turn 012345 into a number.
+    # keep the config out of git. Quote it, in single quotes if it contains \ or ": YAML would
+    # turn 012345 into a number and read a leading ! as a tag.
     # The launcher writes it to var/run/<name>.radio_password (0600) when it creates the
     # container; it never appears in the rendered compose or the container's environment.
     # tls_fingerprint_sha256: ""  # optional SHA-256 pin of the radio's certificate (64 hex
