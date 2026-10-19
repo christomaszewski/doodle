@@ -73,7 +73,44 @@ Rig replay omits this live radio service by default and keeps its recorded bag t
 `rig replay RUN --include-service doodle` (or `--live INSTANCE`) for deliberate live-radio replay.
 This needs the updated descriptor/launcher and a rebuilt image containing `radioctl.sh ready`.
 
-The build contract declares arm64 and amd64 support. Rig publishes a multiarch index; standalone
-`tools/build_image.sh REGISTRY TAG` retains host-native builds. `RIG_BUILD_NO_CACHE=1` adds
-`--no-cache --pull`. Run `rig certify --repo . --require-build-check` to verify build forwarding
-without building images (Bubblewrap on Linux, sandbox-exec on macOS).
+The build contract declares one runtime-independent image, `doodle_radio`, on Linux arm64 and
+amd64. `jp6m` and `dev` use that same image; tags have no runtime suffix. In a deployment with
+Doodle enabled, Rig v0.2.62 or newer selects it as follows:
+
+| Build scope | Doodle image selection |
+| --- | --- |
+| `rig build` (default `all`) | Both CPUs, including disabled deployment rows |
+| `rig build --scope deployment` | Deployment CPU from `vehicle.yaml` or `--arch` |
+| `rig build --scope host` | Host Docker CPU; runtime comes from machine provisioning/defaults |
+| `rig build --scope deployment,host` | Union of those CPUs, published once at the same tag |
+| `rig build --scope replay` | Omitted by default because `replay.start` is false |
+
+For example, with `platform: jp6m` and `arch: arm64` in `vehicle.yaml`, provision the development
+machine once with `sudo rig provision --platform dev`, then run
+`rig build --scope deployment,host --dry-run` to inspect the selection. An amd64 host adds the
+amd64 member; an arm64 host needs only the arm64 member. Plain `rig build` still builds both.
+Use a fresh `images.tag` for targeted iteration: Rig refuses to replace a broader existing index
+with fewer CPU members. `rig bake --bundle-images` includes only the vehicle's selected CPU.
+
+To include Doodle in a replay build, set this policy in the deployment's `vehicle.yaml`:
+
+```yaml
+replay:
+  services:
+    doodle: {start: true}
+```
+
+This makes the replay scope build both CPUs and also opts replay into contacting the live radio.
+Normally leave the policy off and replay its recorded diagnostics. A later
+`replay --include-service doodle` selects startup only; it does not build missing image members.
+
+Standalone `tools/build_image.sh REGISTRY TAG` retains host-native builds.
+`DOODLE_BUILD_PLATFORM=linux/amd64` selects a standalone CPU; Rig's `RIG_BUILD_PLATFORMS` takes
+precedence. `PUSH=0` keeps a standalone build local (Buildx loading requires a single CPU).
+Rig builds publish with Buildx and append image ref/digest JSONL to `RIG_BUILD_RESULT`.
+`RIG_BUILD_NO_CACHE=1` adds `--no-cache --pull`; `RIG_BUILD_PULL=0` suppresses the parent pull.
+
+Run `rig certify --repo . --require-build-check` to verify build forwarding without building
+images (Bubblewrap on Linux, sandbox-exec on macOS). CI tests image execution on native arm64 and
+amd64 runners, and checks the actual Rig scope planner against this descriptor. Run those scope
+checks locally with `RIG_SOURCE=/path/to/rig python3 -m unittest discover -s tests -p 'test_build*.py' -v`.

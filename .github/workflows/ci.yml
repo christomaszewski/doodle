@@ -28,7 +28,13 @@ jobs:
   # the INSTALLED entrypoints (and real rclpy) are what gets exercised.
   # ---------------------------------------------------------------------------
   build-image:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {arch: amd64, runner: ubuntu-24.04}
+          - {arch: arm64, runner: ubuntu-24.04-arm}
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
@@ -36,11 +42,12 @@ jobs:
         with:
           context: .
           file: docker/Dockerfile.runtime
+          platforms: linux/${{ matrix.arch }}
           push: false
           load: true
           tags: doodle_radio:ci
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=doodle-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=doodle-${{ matrix.arch }}
           build-args: |
             ROS_DISTRO=${{ env.ROS_DISTRO }}
       - name: Test installed supervisor against the simulated radio
@@ -78,32 +85,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: build_image.sh forwards the rig build env
+      - uses: actions/checkout@v4
+        with:
+          repository: christomaszewski/rig
+          path: .rig
+      - run: python3 -m pip install --user pyyaml
+      - name: Portable builder and Rig scope selection
         run: |
-          mkdir -p "${RUNNER_TEMP}/stub"
-          printf '#!/usr/bin/env bash\necho "docker $*" >> "${DOCKER_ARGV_LOG}"\n' \
-            > "${RUNNER_TEMP}/stub/docker"
-          chmod +x "${RUNNER_TEMP}/stub/docker"
-          export PATH="${RUNNER_TEMP}/stub:${PATH}"
-          export DOCKER_ARGV_LOG="${RUNNER_TEMP}/argv.log"
-          must_fail() { if "$@" >/dev/null 2>&1; then echo "expected failure: $*"; exit 1; fi; }
-
-          : > "${DOCKER_ARGV_LOG}"
-          env -u RIG_BUILD_NO_CACHE -u RIG_BASE_IMAGE \
-            tools/build_image.sh reg.example:5000 vtest
-          grep -q -- '-t reg.example:5000/doodle_radio:vtest' "${DOCKER_ARGV_LOG}"
-          grep -q -- '--build-arg ROS_DISTRO=lyrical' "${DOCKER_ARGV_LOG}"
-          grep -q -- '--build-arg BASE_IMAGE=ros:lyrical-ros-core' "${DOCKER_ARGV_LOG}"
-          must_fail grep -q -- '--no-cache' "${DOCKER_ARGV_LOG}"
-          must_fail grep -q -- '--pull' "${DOCKER_ARGV_LOG}"
-
-          : > "${DOCKER_ARGV_LOG}"
-          RIG_BUILD_NO_CACHE=1 ROS_DISTRO=zephyrous \
-            RIG_BASE_IMAGE=reg.example:5000/fleet-ros:v9 \
-            tools/build_image.sh reg.example:5000 vtest
-          grep -q -- '--no-cache --pull' "${DOCKER_ARGV_LOG}"
-          grep -q -- '--build-arg ROS_DISTRO=zephyrous' "${DOCKER_ARGV_LOG}"
-          grep -q -- '--build-arg BASE_IMAGE=reg.example:5000/fleet-ros:v9' "${DOCKER_ARGV_LOG}"
+          RIG_SOURCE="$PWD/.rig" python3 -m unittest discover -s tests -p 'test_build*.py' -v
 
   # ---------------------------------------------------------------------------
   # Everything without a radio or ROS: config validation, power levels, the
@@ -122,4 +111,4 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: shellcheck launcher + build script + entrypoints
-        run: shellcheck doodle-up tools/build_image.sh docker/entrypoints/*.sh
+        run: shellcheck doodle-up tools/build_image.sh tools/rig-build.sh docker/entrypoints/*.sh

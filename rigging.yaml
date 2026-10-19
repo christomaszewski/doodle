@@ -24,6 +24,8 @@ examples:
 build:
   command: tools/build_image.sh
   images: [doodle_radio]
+  # One runtime-independent Linux image for jp6m, dev and other deployment runtimes.
+  # No build.platforms: scopes select CPUs, without adding a runtime suffix to the tag.
   architectures: [arm64, amd64]
   capabilities: {no_cache: true, platforms: true}
 
