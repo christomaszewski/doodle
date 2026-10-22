@@ -9,6 +9,8 @@ verbs:
   status: "ps"       # rig may append `--format json` to parse `docker compose ps`
   logs: "logs"
   config: "config"   # rendered compose; carries the password FILE PATH, never the password
+  images: "images"
+  runtime-images: "runtime-images"
   # No operational-state trio (standby/activate/state) in v1: a fleet-wide standby must not
   # silently lower the power of the link operators may be using. Runtime changes go through the
   # launcher's own `tx-power` verb.
@@ -39,6 +41,7 @@ build:
 launch_surface:
   - doodle-up
   - tools/render_config.py
+  - tools/runtime_images.py
   - tools/wait_ready.py
   - docker/entrypoints/doodle_config.py
   - docker/compose/compose.deploy.yaml

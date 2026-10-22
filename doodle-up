@@ -57,6 +57,15 @@ ARGS=("$@")
 [ ${#ARGS[@]} -eq 0 ] && ARGS=(up)
 [ "${ARGS[0]}" = "status" ] && ARGS=(ps "${ARGS[@]:1}")
 
+case "${ARGS[0]}" in
+  runtime-images|images)
+    exec "$PYTHON" "$REPO/tools/runtime_images.py" "${ARGS[0]}" "${FILES[@]}" ;;
+esac
+if [ "${ARGS[0]}" = up ] && [ "${RIG_RUNTIME_IMAGE_PINS+x}" ]; then
+  # Reject changed images or startup overrides before writing the password secret.
+  "$PYTHON" "$REPO/tools/runtime_images.py" validate-pins "${FILES[@]}" -- "${ARGS[@]:1}"
+fi
+
 # --- tx-power: talk to the running supervisor; never creates a container -------------------------
 # Stdout discipline: only the status JSON on stdout, human lines on stderr.
 if [ "${ARGS[0]}" = "tx-power" ]; then
@@ -123,10 +132,17 @@ DETACHED=""
 for a in "${ARGS[@]:1}"; do case "$a" in -d|--detach) DETACHED=1;; esac; done
 if [ "${ARGS[0]}" = "up" ] && [ -n "$DETACHED" ]; then
   echo "doodle-up: project=$COMPOSE_PROJECT_NAME namespace=$NAMESPACE" >&2
-  docker compose "${FILES[@]}" "${ARGS[@]}"
+  if [ "${RIG_RUNTIME_IMAGE_PINS+x}" ]; then
+    "$PYTHON" "$REPO/tools/runtime_images.py" pinned-up "${FILES[@]}" -- "${ARGS[@]:1}"
+  else
+    docker compose "${FILES[@]}" "${ARGS[@]}"
+  fi
   exec "$PYTHON" "$REPO/tools/wait_ready.py" docker compose "${FILES[@]}" \
     exec -T radio /usr/local/bin/radioctl.sh ready
 fi
 
 echo "doodle-up: project=$COMPOSE_PROJECT_NAME namespace=$NAMESPACE" >&2
+if [ "${ARGS[0]}" = up ] && [ "${RIG_RUNTIME_IMAGE_PINS+x}" ]; then
+  exec "$PYTHON" "$REPO/tools/runtime_images.py" pinned-up "${FILES[@]}" -- "${ARGS[@]:1}"
+fi
 exec docker compose "${FILES[@]}" "${ARGS[@]}"
