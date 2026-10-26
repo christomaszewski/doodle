@@ -39,6 +39,7 @@ class FakeRadio:
         # ath9k_tpcd's ACK/broadcast power overrides (255 = follow the level), read via debugfs
         self.debugfs = {"txpower_selfgen": "255\n", "txpower_mcast": "255\n"}
         self.sta_stats, self.mesh_stats = [], []  # linkstate peer entries (format synthetic)
+        self.noise = -94.0               # linkstate noise floor; None = not in the report
 
     # --- scenario helpers ------------------------------------------------------------------------
 
@@ -166,7 +167,8 @@ class FakeRadio:
                     "sysinfo": {"cpu_load": [20000, 18000, 19000], "freemem": 12000000,
                                 "localtime": 1700000000},
                     "oper_chan": self.channel, "oper_freq": self.frequency, "chan_width": "20",
-                    "noise": -94.0, "noise_peak": -92.0, "activity": 1, "lna_status": "1",
+                    **({} if self.noise is None else {"noise": self.noise}),
+                    "noise_peak": -92.0, "activity": 1, "lna_status": "1",
                     "sta_count": len(self.sta_stats), "sta_stats": self.sta_stats,
                     "mesh_count": len(self.mesh_stats), "mesh_stats": self.mesh_stats})}
             prefix = "/sys/kernel/debug/ieee80211/phy0/ath9k/"

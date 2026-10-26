@@ -61,6 +61,8 @@ tx_power:
 #   limits:                     # metric -> warn_above/warn_below/error_above/error_below
 #     links.stations: {warn_below: 1}     # e.g. warn when no peer is in range
 #     rf.noise_dbm: {warn_above: -85}     # e.g. warn on a noisy channel
+#     link.signal_dbm: {warn_below: -80}  # e.g. warn per peer on a weak signal (also link.snr_db,
+#                                         #   link.loss_pct, mesh.quality_pct)
 
 # Zenoh session settings (only with RMW_IMPLEMENTATION=rmw_zenoh_cpp); same block as the other rig
 # ROS services. `overrides` (nested config flattened to path=json pairs) is the useful part here;
