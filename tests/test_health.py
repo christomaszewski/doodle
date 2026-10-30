@@ -191,6 +191,50 @@ class HealthTests(unittest.TestCase):
         self.assertNotIn("link.rssi", gone["values"])  # never a stale reading presented as current
         self.assertEqual(gone["values"]["health.availability"], "current")
 
+    def test_peers_carry_vendor_neutral_link_quality(self):
+        self.radio.sta_stats = [{"mac": PEER, "rssi": -61, "pl_ratio": 3, "tx_mcs": 7},
+                                {"mac": "00:30:1a:00:00:03", "rssi": "-70", "snr": 21},
+                                {"mac": "00:30:1a:00:00:04", "rssi": 60}]  # a vendor scale, not dBm
+        self.radio.mesh_stats = [{"orig_address": "00:30:1a:00:00:02", "tq": 204}]
+        self.reporter.poll(self.api)
+        rows = self.rows()
+        near = rows[f"link/{PEER.lower()}"]["values"]
+        self.assertEqual((near["link.signal_dbm"], near["link.snr_db"], near["link.loss_pct"]),
+                         (-61, 33.0, 3))  # SNR from this report's -94 dBm noise floor
+        self.assertEqual(near["link.rssi"], -61)  # the vendor field stays alongside
+        reported = rows["link/00:30:1a:00:00:03"]["values"]
+        self.assertEqual((reported["link.signal_dbm"], reported["link.snr_db"]), (-70, 21))
+        vendor = rows["link/00:30:1a:00:00:04"]["values"]
+        self.assertNotIn("link.signal_dbm", vendor)
+        self.assertNotIn("link.snr_db", vendor)
+        self.assertEqual(rows["mesh/00:30:1a:00:00:02"]["values"]["mesh.quality_pct"], 80)
+        self.assertNotIn("link.quality_pct", near)
+
+        self.radio.noise = None  # no noise floor in the report: no derived SNR
+        self.clock.now = 10
+        self.reporter.poll(self.api)
+        near = self.rows()[f"link/{PEER.lower()}"]["values"]
+        self.assertEqual(near["link.signal_dbm"], -61)
+        self.assertNotIn("link.snr_db", near)
+
+        self.radio.sta_stats = []  # departed: no measurement presented as current
+        self.clock.now = 20
+        self.reporter.poll(self.api)
+        gone = self.rows()[f"link/{PEER.lower()}"]["values"]
+        self.assertNotIn("link.signal_dbm", gone)
+        self.assertEqual(gone["link.present"], False)
+
+    def test_link_limits_apply_per_peer(self):
+        self.reporter = HealthReporter("mesh", settings={"limits": {
+            "link.signal_dbm": {"warn_below": -80, "error_below": -90}}}, clock=self.clock)
+        self.radio.sta_stats = [{"mac": PEER, "rssi": -85}, {"mac": "00:30:1a:00:00:03", "rssi": -50}]
+        self.reporter.poll(self.api)
+        rows = self.rows()
+        weak = rows[f"link/{PEER.lower()}"]
+        self.assertEqual(weak["level"], WARN)
+        self.assertIn("link.signal_dbm -85 crossed warn_below -80", weak["message"])
+        self.assertEqual(rows["link/00:30:1a:00:00:03"]["level"], OK)
+
     def test_configured_limits_raise_the_level(self):
         self.reporter = HealthReporter("mesh", settings={"limits": {
             "links.stations": {"warn_below": 1}, "rf.noise_dbm": {"error_above": -95}}},

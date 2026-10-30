@@ -31,6 +31,13 @@ MAC = re.compile(r"^[0-9a-f]{2}(:[0-9a-f]{2}){5}$")
 # Field names that usually carry a peer's address; any MAC-shaped value is the fallback.
 MAC_FIELDS = ("mac", "macaddr", "mac_addr", "addr", "address", "orig_address", "originator",
               "station", "sta")
+# Vendor fields behind the vendor-neutral link quality keys (SERVICE_HEALTH.md Revision 3). The
+# per-peer linkstate format is not observed on hardware yet: these are the names the radio's
+# linkstate configuration enables (include_rssi, include_pl_ratio, include_mesh_tq), plus common
+# spellings. A value outside the key's plausible range (an RSSI on a vendor scale) is not mapped.
+SIGNAL_FIELDS = ("signal_dbm", "rssi_dbm", "rssi", "signal")
+SNR_FIELDS = ("snr_db", "snr")
+LOSS_FIELDS = ("loss_pct", "pl_ratio")     # pl_ratio is a percentage: the radio alerts above 60
 MAX_LOST_PEERS = 32                        # departed peers remembered (oldest dropped first)
 MAX_TEXT = 256                             # longest string value copied from a peer entry
 
@@ -78,6 +85,34 @@ def _peer_values(prefix, entry):
             values[key] = value[:MAX_TEXT]
         elif isinstance(value, (list, dict)):
             values[key] = json.dumps(value, sort_keys=True, allow_nan=False, default=str)[:MAX_TEXT]
+    return values
+
+
+def _measure(entry, names, low, high):
+    for name in names:
+        value = _float(entry.get(name))
+        if value is not None and low <= value <= high:
+            return value
+    return None
+
+
+def link_quality(kind, entry, noise_dbm=None):
+    """One peer's link in vendor-neutral keys: signal, SNR (reported, or derived from this same
+    report's noise floor), link quality (BATMAN TQ as a percentage) and packet loss. A measurement
+    the peer entry lacks is left out, never zero."""
+    values = {}
+    signal = _measure(entry, SIGNAL_FIELDS, -130, 0)
+    snr = _measure(entry, SNR_FIELDS, -30, 90)
+    if snr is None and signal is not None and numeric(noise_dbm):
+        snr = round(signal - noise_dbm, 1)
+    quality = _measure(entry, ("quality_pct",), 0, 100)
+    tq = _measure(entry, ("tq",), 0, 255)
+    if quality is None and tq is not None:
+        quality = round(tq * 100 / 255)
+    for key, value in (("signal_dbm", signal), ("snr_db", snr), ("quality_pct", quality),
+                       ("loss_pct", _measure(entry, LOSS_FIELDS, 0, 100))):
+        if value is not None:
+            values[f"{kind}.{key}"] = value
     return values
 
 
@@ -281,6 +316,7 @@ class HealthReporter:
         now = self.clock()
         reports, unidentified = [], 0
         counts = {}
+        noise = _float(linkstate.get("noise"))
         for kind, field, count_key in (("link", "sta_stats", "sta_count"),
                                        ("mesh", "mesh_stats", "mesh_count")):
             entries = linkstate.get(field) if isinstance(linkstate.get(field), list) else []
@@ -293,7 +329,8 @@ class HealthReporter:
                     unidentified += 1
                     continue
                 present.add(mac)
-                self.peers[(kind, mac)] = {"seen": now, "values": _peer_values(f"{kind}.", entry)}
+                self.peers[(kind, mac)] = {"seen": now, "values": {
+                    **_peer_values(f"{kind}.", entry), **link_quality(kind, entry, noise)}}
             for (peer_kind, mac), peer in self.peers.items():
                 if peer_kind != kind:
                     continue

@@ -87,7 +87,7 @@ hostname.
 | `service` | supervisor state: target vs. effective power, RF state, range, change in progress, last error | ERROR on an error, WARN while not at target, STALE before the first observation |
 | `radio` | `iwinfo info`, `linkstate`, `uci wireless`, ath9k debugfs: power, channel, frequency, bandwidth, noise/peak, channel activity, LNA, automatic power control, ACK/broadcast power | WARN when ACK/broadcast power exceeds the level, or when a supported measurement is temporarily unavailable |
 | `links` | `linkstate` peer counts | OK (use `limits`, e.g. `links.stations: {warn_below: 1}`) |
-| `link/<mac>`, `mesh/<mac>` | one `sta_stats` / `mesh_stats` entry, every field as `link.*` / `mesh.*` | OK; a departed peer stays listed with `link.present: false` |
+| `link/<mac>`, `mesh/<mac>` | one `sta_stats` / `mesh_stats` entry, every field as `link.*` / `mesh.*`, plus the vendor-neutral `link.signal_dbm` (`rssi`), `link.snr_db` (reported, or signal − noise floor), `mesh.quality_pct` (`tq`), `link.loss_pct` (`pl_ratio`) | OK; a departed peer stays listed with `link.present: false` (use `limits`, e.g. `link.signal_dbm: {warn_below: -80}`) |
 | `system` | `system info` / `system board`: uptime, load, memory, firmware, model | WARN when a value is missing |
 | `temperature` | none — the radio has no sensor | OK, explicitly `unsupported` |
 
@@ -124,5 +124,6 @@ On the radio, with the service up:
 
 ## Waiting on a second radio
 
-Per-peer data formats; automatic power control against a fixed level at close range; reported
+Per-peer data formats (including whether `rssi`, `pl_ratio` and `tq` are the field names behind the
+vendor-neutral link keys, and their units); automatic power control against a fixed level at close range; reported
 vs. radiated power; whether a live power change interrupts the link.
