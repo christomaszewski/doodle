@@ -126,4 +126,5 @@ On the radio, with the service up:
 
 Per-peer data formats (including whether `rssi`, `pl_ratio` and `tq` are the field names behind the
 vendor-neutral link keys, and their units); automatic power control against a fixed level at close range; reported
-vs. radiated power; whether a live power change interrupts the link.
+vs. radiated power; whether a live power change interrupts the link. `tools/radio_bench.py`
+([RADIO_BENCH.md](RADIO_BENCH.md)) captures the per-peer data and tests channel switching.

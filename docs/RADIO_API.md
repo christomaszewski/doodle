@@ -151,9 +151,23 @@ host receipt time.
   `/etc/init.d/wow`, but no ubus object; licensing and a supported control interface are open
   questions. Not used.
 
+## Channel switching (not used by the service)
+
+- `message-system chswitch {count, model, frequency, bandwidth, mode_change, channel_idx}` exists
+  on 2026-03.1. Doodle's API reference lists a mesh-wide coordinated channel switch; the argument
+  meanings are behind a vendor login. Never called on hardware yet.
+- The `message-system` daemon is configured to broadcast on UDP 9994 over the `br-mrlan` bridge,
+  which includes the wired port. `link-recovery` holds a `recovery_wait_time`; whether it acts
+  without a Sense license is unknown. Both come from a saved 2025-06 config.
+- Other unused methods: `iwinfo freqlist`, `freqlist_reg` and `scan`.
+
 ## Not yet verified (needs a second radio)
+
+[RADIO_BENCH.md](RADIO_BENCH.md) covers the first and last two of these.
 
 - Per-peer formats in `linkstate` and the debugfs station files.
 - Automatic power control against a fixed level with a close peer.
 - Reported vs. radiated power (signal-strength change on a peer).
 - Whether a live power change interrupts the link.
+- `chswitch`: arguments, timing, whether it writes flash, and what a radio that misses it does.
+- Whether an RF toggle or a reboot returns a switched radio to its saved channel.
