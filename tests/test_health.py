@@ -103,6 +103,40 @@ class HealthTests(unittest.TestCase):
                           radio["values"]["rf.ack_power_override"]), (29, True))
         self.assertEqual(radio["values"]["rf.broadcast_power_dbm"], 19)
 
+    def test_transmit_airtime_from_survey_counters(self):
+        self.reporter.poll(self.api)  # first poll: the counters since they last restarted
+        values = self.rows()["radio"]["values"]
+        self.assertEqual((values["rf.tx_airtime_pct"], values["rf.rx_airtime_pct"],
+                          values["rf.airtime_window_s"]), (0.05, 0.5, 30.0))
+        self.reporter.poll(self.api)  # then the change since the previous poll
+        values = self.rows()["radio"]["values"]
+        self.assertEqual((values["rf.tx_airtime_pct"], values["rf.rx_airtime_pct"],
+                          values["rf.airtime_window_s"]), (0.04, 0.5, 5.0))
+        self.radio.survey = {"active_time": 2000, "busy_time": 10, "rx_time": 10, "tx_time": 20}
+        self.reporter.poll(self.api)  # counters restarted: what accumulated since then
+        values = self.rows()["radio"]["values"]
+        self.assertEqual((values["rf.tx_airtime_pct"], values["rf.airtime_window_s"]), (1.0, 2.0))
+        self.radio.survey = {"active_time": 100, "busy_time": 0, "rx_time": 0, "tx_time": 0}
+        self.reporter.poll(self.api)  # too short to mean anything: blank, but not a warning
+        radio = self.rows()["radio"]
+        self.assertEqual(radio["level"], OK, radio["message"])
+        self.assertIsNone(radio["values"]["rf.tx_airtime_pct"])
+        self.assertEqual(radio["values"]["health.metric.rf.tx_airtime_pct.state"], "unavailable")
+
+    def test_survey_without_the_method_is_unsupported(self):
+        self.radio.fail["iwinfo.survey"] = 3  # method not found: older firmware
+        self.reporter.poll(self.api)
+        radio = self.rows()["radio"]
+        self.assertEqual(radio["level"], OK, radio["message"])
+        self.assertEqual(radio["values"]["health.metric.rf.tx_airtime_pct.state"], "unsupported")
+        reads = len(self.radio.calls)
+        self.reporter.poll(self.api)
+        self.assertNotIn(("iwinfo", "survey"), [c[:2] for c in self.radio.calls[reads:]])
+        self.radio.fail["iwinfo.survey"] = 7  # other failures are a temporary gap
+        self.radio.reboot()
+        self.reporter.poll(self.api)
+        self.assertIn("iwinfo.survey: timeout", self.rows()["radio"]["message"])
+
     def test_unreadable_debugfs_is_unsupported_not_a_warning(self):
         self.radio.debugfs = {"txpower_mcast": ""}  # selfgen missing; mcast reads empty
         self.reporter.poll(self.api)

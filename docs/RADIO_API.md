@@ -54,12 +54,13 @@ firewall accepts all incoming connections from the mesh. Fielded radios need a s
 | RF on/off | `network.wireless status` | `<radio>.up` |
 | Link status | `file read {path:/tmp/linkstate_current.json}` | see below |
 | ACK/broadcast power | `file read {path:/sys/kernel/debug/ieee80211/<phy>/ath9k/txpower_selfgen}` (and `txpower_mcast`) | integer dBm, 255 = follow the level |
+| Airtime | `iwinfo survey {device}` | the `results[]` entry whose `mhz` is the operating frequency: `active_time`, `busy_time`, `rx_time`, `tx_time` (ms, cumulative; they restart now and then) |
 | **Set power** | `file exec {command:/usr/sbin/iw, params:[dev,<device>,set,txpower,fixed,<dBm×100>]}` | reply `{code, stdout, stderr}` |
 | **RF off / on** | `network.wireless down` / `up` `{device:<radio>}` | — |
 
 Two sessions: the supervisor's (changes and the reconcile reads) and the diagnostics poll's
-(every 5 s: `system info`, `network.wireless status`, `iwinfo info`, `uci get`, the link report
-and the two debugfs files; `system board` once and after a reboot). Reading the link report and
+(every 5 s: `system info`, `network.wireless status`, `iwinfo info`, `iwinfo survey`, `uci get`,
+the link report and the two debugfs files; `system board` once and after a reboot). Reading the link report and
 the debugfs files *through the API* is not yet verified on hardware (they were read over SSH):
 an empty or missing debugfs reply is reported as `unsupported`, a failed link-report read as
 `unavailable`.
@@ -137,8 +138,18 @@ host receipt time.
 
 ## Not available
 
-- Temperature: no hwmon or thermal sensors.
-- Radio Silence Mode (`wow.wow.fullsilence`) exists in 2026-03 but appears license-gated; not used.
+- Temperature, supply voltage, current or power: the radio has no hwmon class, IIO devices,
+  thermal zones or power-supply entries, so it cannot report its own power draw. The closest
+  proxy is transmit airtime (`iwinfo survey`, reported as `rf.tx_airtime_pct`): idle with no
+  peers, the transmitter was on about 0.03 % of the time (2 ms in 6 s), so the power level
+  barely affects heat until there is traffic. Measure supply current externally.
+- Radio Silence and Covert Monitoring modes (2026-03 release notes) are part of the separately
+  licensed Sense-EW feature set. Radio Silence: the vehicle radio stops transmitting and only
+  listens to broadcasts from the GCS. Covert Monitoring: a ground radio stays silent and receives
+  the vehicle's video broadcasts (no-ACK broadcast with FEC). The firmware carries a `wow` UCI
+  config (`enabled`, `encrypt`, `key`, `macaddress`, `fullsilence`, `silent_all_iface`) and
+  `/etc/init.d/wow`, but no ubus object; licensing and a supported control interface are open
+  questions. Not used.
 
 ## Not yet verified (needs a second radio)
 

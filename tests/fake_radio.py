@@ -40,6 +40,9 @@ class FakeRadio:
         self.debugfs = {"txpower_selfgen": "255\n", "txpower_mcast": "255\n"}
         self.sta_stats, self.mesh_stats = [], []  # linkstate peer entries (format synthetic)
         self.noise = -94.0               # linkstate noise floor; None = not in the report
+        # `iwinfo survey` counters (ms) for the current channel; each read adds `survey_step`
+        self.survey = {"active_time": 30000, "busy_time": 250, "rx_time": 150, "tx_time": 15}
+        self.survey_step = {"active_time": 5000, "busy_time": 40, "rx_time": 25, "tx_time": 2}
 
     # --- scenario helpers ------------------------------------------------------------------------
 
@@ -140,6 +143,13 @@ class FakeRadio:
             if method == "txpowerlist":
                 return {"results": [{"dbm": d, "mw": round(10 ** (d / 10)),
                                      "active": d == self.txpower} for d in self.supported]}
+            if method == "survey":
+                current = dict(self.survey, mhz=self.frequency, noise=-94, busy_time_ext=0)
+                for key, step in self.survey_step.items():
+                    self.survey[key] += step
+                other = {"mhz": self.frequency + 5, "noise": 0, "active_time": 0,
+                         "busy_time": 0, "busy_time_ext": 0, "rx_time": 0, "tx_time": 0}
+                return {"results": [other, current]}
         if (obj, method) == ("uci", "get"):
             if args == {"config": "wireless", "section": "radio0"}:
                 return {"values": {".type": "wifi-device", ".name": "radio0", "chanbw": "20",

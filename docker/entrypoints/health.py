@@ -40,6 +40,7 @@ SNR_FIELDS = ("snr_db", "snr")
 LOSS_FIELDS = ("loss_pct", "pl_ratio")     # pl_ratio is a percentage: the radio alerts above 60
 MAX_LOST_PEERS = 32                        # departed peers remembered (oldest dropped first)
 MAX_TEXT = 256                             # longest string value copied from a peer entry
+MIN_AIRTIME_WINDOW_MS = 1000               # shortest counter window worth a percentage
 
 
 def numeric(value):
@@ -139,7 +140,8 @@ class HealthReporter:
         self.board = None
         self.uptime = None
         self.hardware_id = ""
-        self.override_state = {}  # debugfs name -> "unsupported" once the API cannot read it
+        self.capability_state = {}  # read -> "unsupported" once the API cannot provide it
+        self.survey_previous = None  # (frequency, airtime counters) from the previous poll
         self.started = clock()
         self.lock = threading.RLock()
 
@@ -181,7 +183,7 @@ class HealthReporter:
                 if board is not None:
                     self.identify(board)
             if rebooted:
-                self.override_state.clear()  # a firmware change may have changed what is readable
+                self.capability_state.clear()  # a firmware change may change what is readable
             if numeric(uptime):
                 self.uptime = uptime
             rf_up = attempt("rf", radio.rf_up)
@@ -196,12 +198,17 @@ class HealthReporter:
             if rf_up and isinstance(phy, str) and PHY.match(phy):
                 for name in ("txpower_selfgen", "txpower_mcast"):
                     overrides[name] = self._read_override(radio, phy, name, errors)
+            survey = None
+            frequency = (wireless or {}).get("frequency")
+            if rf_up and numeric(frequency) and "survey" not in self.capability_state:
+                survey = self._read_survey(radio, frequency, errors)
         except RadioError as error:  # unreachable, login rejected: nothing in this pass is current
             for group in GROUPS:
                 self.fail(group, error)
             return
 
-        self.record("radio", [self._radio(rf_up, wireless, control, linkstate, overrides, errors)])
+        self.record("radio", [self._radio(rf_up, wireless, control, linkstate, overrides, survey,
+                                          errors)])
         if linkstate is None:
             self.fail("links", errors.get("linkstate", "no link report"))
         else:
@@ -211,14 +218,47 @@ class HealthReporter:
         else:
             self.record("system", self._system(system))
 
+    def _read_survey(self, radio, frequency, errors):
+        try:
+            return radio.survey(frequency)
+        except UbusError as error:
+            if error.status in (3, 8):  # no `iwinfo survey` on this firmware
+                self.capability_state["survey"] = "unsupported"
+                return None
+            errors["survey"] = error
+        except ReplyError as error:
+            errors["survey"] = error
+        return None
+
+    def _airtime(self, frequency, counters):
+        """Percent of the channel's active time spent transmitting and receiving, from the
+        counter change since the previous poll. When the counters restart (other readers,
+        channel changes), the current counters alone cover the time since the restart."""
+        keys = ("active_time", "rx_time", "tx_time")
+        previous, self.survey_previous = self.survey_previous, (frequency, counters)
+        if not counters or not all(numeric(counters.get(k)) for k in keys):
+            return None
+        window = counters
+        if previous and previous[0] == frequency and all(numeric(previous[1].get(k))
+                                                         for k in keys):
+            delta = {k: counters[k] - previous[1][k] for k in keys}
+            if delta["active_time"] >= MIN_AIRTIME_WINDOW_MS and min(delta.values()) >= 0:
+                window = delta
+        active = window["active_time"]
+        if active < MIN_AIRTIME_WINDOW_MS:
+            return None
+        return {"tx": round(100 * window["tx_time"] / active, 3),
+                "rx": round(100 * window["rx_time"] / active, 3),
+                "window_s": round(active / 1000, 1)}
+
     def _read_override(self, radio, phy, name, errors):
-        if self.override_state.get(name) == "unsupported":
+        if self.capability_state.get(name) == "unsupported":
             return None
         try:
             text = radio.read_text(DEBUGFS.format(phy=phy, name=name)).strip()
         except UbusError as error:
             if error.status == 4:  # no such file: not an ath9k radio with automatic power control
-                self.override_state[name] = "unsupported"
+                self.capability_state[name] = "unsupported"
                 return None
             errors[name] = error
             return None
@@ -227,20 +267,20 @@ class HealthReporter:
             return None
         if not re.fullmatch(r"-?\d+", text):
             # rpcd reads nothing from a file that reports size 0 on some builds: not readable here
-            self.override_state[name] = "unsupported"
+            self.capability_state[name] = "unsupported"
             return None
         return int(text)
 
-    def _radio(self, rf_up, wireless, control, linkstate, overrides, errors):
+    def _radio(self, rf_up, wireless, control, linkstate, overrides, survey, errors):
         values = {"rf.state": "on" if rf_up else "off" if rf_up is False else None}
         missing = []  # sources of temporarily unavailable measurements (unsupported is not news)
 
-        def put(key, value, *, state=None, source=None):
+        def put(key, value, *, state=None, source=None, warn=True):
             values[key] = value
             if value is None:
                 reason = state or "unavailable"
                 values[f"health.metric.{key}.state"] = reason
-                if reason != "unsupported":
+                if reason != "unsupported" and warn:
                     missing.append(source or key)
 
         if rf_up is None:
@@ -284,12 +324,20 @@ class HealthReporter:
                               ("rf.broadcast_power_dbm", "txpower_mcast")):
                 raw = overrides.get(name)
                 if raw is None:
-                    state = self.override_state.get(name) or (
+                    state = self.capability_state.get(name) or (
                         "unavailable" if readable else "unsupported")
                     put(key, None, state=state, source="wireless" if not overrides else name)
                     continue
                 values[key.replace("_dbm", "_override")] = raw != NO_OVERRIDE
                 put(key, level if raw == NO_OVERRIDE else raw, source=name)
+            # Transmit airtime: with the level, the best available proxy for the power the
+            # amplifier turns into heat (the radio has no current or temperature sensors).
+            airtime = self._airtime(wireless.get("frequency"), survey) if survey else None
+            survey_state = self.capability_state.get("survey") or "unavailable"
+            for key, part in (("rf.tx_airtime_pct", "tx"), ("rf.rx_airtime_pct", "rx"),
+                              ("rf.airtime_window_s", "window_s")):
+                put(key, airtime[part] if airtime else None, state=survey_state, source="survey",
+                    warn=survey is None and "survey" in errors)
 
         warnings = []
         if missing:

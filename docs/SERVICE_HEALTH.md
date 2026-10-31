@@ -87,6 +87,8 @@ port, not a measurement.
 | `rf.auto_power_control`, `rf.auto_power_control_aggressive` | bool | Vendor automatic power control |
 | `rf.ack_power_dbm`, `rf.broadcast_power_dbm` | dBm | Power of ACK and broadcast frames |
 | `rf.ack_power_override`, `rf.broadcast_power_override` | bool | Those differ from the level |
+| `rf.tx_airtime_pct`, `rf.rx_airtime_pct` | percent | Share of the radio's time on the channel spent transmitting, receiving |
+| `rf.airtime_window_s` | s | Time those percentages cover |
 | `links.stations`, `links.mesh_nodes` | count | Peers in the radio's link report |
 | `links.unidentified` | count | Peer entries without a recognizable address |
 | `link.<field>`, `mesh.<field>` | vendor | One peer's fields as the radio reports them |

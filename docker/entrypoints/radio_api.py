@@ -245,6 +245,16 @@ class RadioAPI:
         return sorted({r["dbm"] for r in results if isinstance(r, dict)
                        and isinstance(r.get("dbm"), int) and not isinstance(r["dbm"], bool)})
 
+    def survey(self, frequency):
+        """Cumulative airtime counters (ms) of the channel at `frequency` MHz: how long the
+        radio was on it, sensed it busy, received and transmitted."""
+        data = self.call("iwinfo", "survey", {"device": self.device})
+        for entry in data.get("results") if isinstance(data.get("results"), list) else []:
+            if isinstance(entry, dict) and entry.get("mhz") == frequency:
+                return {key: entry.get(key)
+                        for key in ("active_time", "busy_time", "rx_time", "tx_time")}
+        raise ReplyError(f"iwinfo.survey: no entry for {frequency} MHz")
+
     def rf_up(self):
         # The full reply includes the mesh key; only the up flag leaves this method.
         radio = self.call("network.wireless", "status").get(self.uci_radio)
