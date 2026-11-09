@@ -55,12 +55,29 @@ EXPECTED = {"link": ("link.signal_dbm", "link.snr_db", "link.loss_pct"),
 SAVED_WIRELESS = "/etc/config/wireless"  # only ever `file stat`: its contents include the mesh key
 VENDOR_CONFIGS = ("message-system", "central_acs", "acs_multiband", "acs_manual_switch",
                   "link-recovery")
+SHELL_PATH = "/usr/sbin:/usr/bin:/sbin:/bin"  # rpcd may run commands with no PATH at all
+STDERR_CHARS = 400        # of a radio command's error text kept in reports
+COMMAND_LIMIT = 25        # s one radio command may run: under EXEC_TIMEOUT and uhttpd's cut-off
+# One place per command: a slow grep over a whole squashfs once timed out everything at once.
+CALLER_PLACES = ("/usr/sbin", "/etc/init.d", "/usr/share/rpcd /usr/share/luci /usr/share/ucode",
+                 "/usr/lib/lua", "/www", "/usr/bin /sbin /usr/libexec /lib/functions /lib/netifd "
+                 "/lib/wifi /etc/hotplug.d /etc/uci-defaults")
+# grep's own errors (a missing directory) are expected, so its stderr goes nowhere; the exit status
+# still says whether it timed out or could not run at all, so neither reads as "none".
+CALLER_SEARCH = ("out=$(timeout {limit} grep -rn -E 'chswitch|mode_change|channel_idx' {places} "
+                 "2>/dev/null); status=$?; printf '%s\\n' \"$out\" | cut -c1-240 | head -100; "
+                 "case $status in 124|137|143) echo \"timed out after {limit} s\" >&2; exit 124;; "
+                 "126|127) echo \"timeout or grep is missing on the radio\" >&2; exit 127;; esac")
 VENDOR_SHELL = {
+    # It always lists chswitch when commands run at all: an empty answer here means they do not.
     "signature": "ubus -v list message-system",
-    "callers": "grep -rn -E 'chswitch|mode_change|channel_idx' /usr/sbin /usr/bin /usr/share "
-               "/usr/lib/lua /etc/init.d /www 2>/dev/null | cut -c1-240 | head -200",
-    "strings": "strings /usr/sbin/message-system | grep -i -E "
-               "'chswitch|channel|bandwidth|mode_change|model' | head -80"}
+    "strings": "for f in /usr/sbin/message-system /usr/sbin/dl-central-acs /usr/sbin/acs_multiband "
+               "/usr/sbin/acs_manual_switch; do [ -e \"$f\" ] || continue; "
+               "out=$(timeout 5 strings \"$f\" | grep -i -E "
+               "'chswitch|channel|bandwidth|mode_change|model|freq' | head -60); "
+               "[ -n \"$out\" ] && printf '== %s\\n%s\\n' \"$f\" \"$out\"; done; true",
+    **{f"callers {places.split()[0]}": CALLER_SEARCH.format(limit=COMMAND_LIMIT, places=places)
+       for places in CALLER_PLACES}}
 ONE_SHOTS = {
     "station_dump": 'iw dev "$0" station dump',
     "peer_debugfs": 'for f in /sys/kernel/debug/ieee80211/*/netdev:"$0"/stations/*/'
@@ -185,11 +202,19 @@ class Node:
         return seen
 
     def shell(self, command, *arguments, timeout=EXEC_TIMEOUT):
-        """Arguments arrive as $0, $1…, never inside the command text."""
-        reply = self.api.call("file", "exec", {"command": "/bin/sh",
-                                               "params": ["-c", command, *arguments]},
-                              timeout=timeout)
-        return {"code": reply.get("code"), "stdout": redact(str(reply.get("stdout") or ""))}
+        """Arguments arrive as $0, $1…, never inside the command text. The exit status and
+        stderr come back too: an empty stdout alone cannot tell "found nothing" from "never ran"."""
+        try:
+            reply = self.api.call("file", "exec", {"command": "/bin/sh",
+                                                   "params": ["-c", command, *arguments],
+                                                   "env": {"PATH": SHELL_PATH}}, timeout=timeout)
+        except RadioError as error:
+            if "timed out" not in str(error):
+                raise
+            raise RadioError(f"no answer within {timeout:g} s: probably a slow command on a radio "
+                             f"that is otherwise fine ({error})") from None
+        return {"code": reply.get("code"), "stdout": redact(str(reply.get("stdout") or "")),
+                "stderr": redact(str(reply.get("stderr") or ""))[:STDERR_CHARS]}
 
     def ping(self, host):
         """Data through the mesh, not just a peer entry. The radios' wired ports are on separate
@@ -432,13 +457,39 @@ def discover(bench, _args):
             read(f"config/{config}",
                  lambda: redact(node.api.call("uci", "get", {"config": config}).get("values")))
         for name, command in VENDOR_SHELL.items():
-            read(f"vendor/{name}", lambda: node.shell(command)["stdout"])
+            read(f"vendor/{name}", lambda: node.shell(command))
         radios[node.name] = found
     boards = [found["board"].get("firmware") for found in radios.values()]
-    return {"ok": True, "radios": radios, "findings": {
-        "firmware": boards, "same_firmware": len(set(boards)) == 1,
-        "callers_found": {name: isinstance(found["vendor/callers"], str)
-                          and bool(found["vendor/callers"]) for name, found in radios.items()}}}
+    verdicts = {key: {name: searched(found[f"vendor/{key}"]) for name, found in radios.items()}
+                for key in VENDOR_SHELL}
+    runs = {name: "chswitch" in str((found["vendor/signature"] or {}).get("stdout", ""))
+            for name, found in radios.items()}
+    callers = {name: summarize({key.split(" ", 1)[1]: verdicts[key][name] for key in verdicts
+                                if key.startswith("callers ")}) for name in radios}
+    return {"ok": all(runs.values()), "radios": radios, "findings": {
+        "firmware": boards, "same_firmware": len(set(boards)) == 1, "commands_run": runs,
+        "signature": verdicts["signature"], "strings": verdicts["strings"], "callers": callers}}
+
+
+def summarize(verdicts):
+    """One verdict for a search split over several commands, keeping where it came from."""
+    found = [place for place, verdict in verdicts.items() if verdict == "found"]
+    failed = [f"{place}: {verdict[len('failed: '):]}" for place, verdict in verdicts.items()
+              if verdict.startswith("failed")]
+    if found:
+        return "found in " + ", ".join(found) + (f" (also failed: {'; '.join(failed)})"
+                                                  if failed else "")
+    return "failed: " + "; ".join(failed) if failed else "none"
+
+
+def searched(result):
+    """found, none, or why the command failed: an empty answer must never be ambiguous."""
+    if not isinstance(result, dict) or "code" not in result:
+        return f"failed: {(result or {}).get('error', 'no reply')}"
+    output, problem = result["stdout"].strip(), result["stderr"].strip()
+    if result["code"] not in (0, None) or (problem and not output):
+        return f"failed: exit {result['code']}: {problem or 'no error text'}"
+    return "found" if output else "none"
 
 
 def capture(bench, args):
@@ -468,7 +519,8 @@ def capture(bench, args):
         extras[node.name]["survey_end"] = survey(node, bench)
         for name, command in ONE_SHOTS.items():
             try:
-                extras[node.name][name] = node.shell(command, node.api.device)["stdout"]
+                result = node.shell(command, node.api.device)
+                extras[node.name][name] = result["stdout"] or searched(result)
             except RadioError as error:
                 extras[node.name][name] = f"failed: {error}"
     peers = {kind: {node.name: inventory(entries[kind].get(node.name, []), kind)

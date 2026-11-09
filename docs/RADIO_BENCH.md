@@ -8,7 +8,7 @@ vehicle that can fly.
 | Question | Stage | Changes the radios | Read in `report.json` |
 |---|---|---|---|
 | Is everything working? | `check` | Only after the read-only checks pass and you agree | `checks` (also printed as it runs) |
-| How does the firmware call `chswitch`? | `discover` | No | `radios.a["vendor/callers"]`, `["vendor/strings"]`, `["config/…"]` |
+| How does the firmware call `chswitch`? | `discover` | No | `findings.callers` (`found`, `none` or why it failed), then `radios.a["vendor/callers"]`, `["vendor/strings"]`, `["config/…"]` |
 | What do peer entries hold, and does the service's mapping survive them? | `capture` | No | `peers`, `findings.not_published` |
 | How long does a switch take? Does it touch saved config or TX power? | `hop` | Yes | `findings.timing`, `findings.saved_config_rewritten`, `findings.tx_power_changed` |
 | What if one radio misses the switch? | `missed` | Yes | `findings.rejoined_by_itself`, `findings.b_landed_on` |

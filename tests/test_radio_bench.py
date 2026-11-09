@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import subprocess
 import sys
 import tempfile
 from types import SimpleNamespace
@@ -48,6 +49,7 @@ class BenchRadio(FakeRadio):
         self.reached_through = None     # radio b on a one-wire bench: reachable only when linked
         self.misses, self.heard = set(), 0  # which of the peer's switches this radio fails to hear
         self.firmware = "firmware-2026-03.1"
+        self.exec_replies = {}          # command fragment -> its `file exec` reply
 
     def linked(self):
         return (self.peer is not None and self.rf_up and self.peer.rf_up
@@ -105,6 +107,11 @@ class BenchRadio(FakeRadio):
             if command.startswith("ping"):
                 passes = self.linked() and self.frequency not in self.no_data_on
                 return {"code": 0 if passes else 1}
+            for fragment, reply in self.exec_replies.items():
+                if fragment in command:
+                    if isinstance(reply, Exception):
+                        raise reply
+                    return reply
             return {"code": 0, "stdout": "chswitch count model frequency\n"
                                          f"wizard -n mesh -k {WIZARD_KEY} -c 51\n"}
         if (obj, method) == ("system", "reboot"):
@@ -256,12 +263,65 @@ class ReadOnlyStageTests(BenchCase):
         status, report = self.stage("discover")
         self.assertEqual(status, 0)
         self.assertUntouched()
-        self.assertTrue(report["findings"]["callers_found"]["a"])
-        self.assertIn("chswitch", report["radios"]["a"]["vendor/callers"])
+        self.assertTrue(report["findings"]["callers"]["a"].startswith("found in /usr/sbin"))
+        self.assertNotIn("failed", report["findings"]["callers"]["b"])
+        self.assertEqual(report["findings"]["commands_run"], {"a": True, "b": True})
+        self.assertIn("chswitch", report["radios"]["a"]["vendor/callers /www"]["stdout"])
         written = "".join(path.read_text() for path in Path(self.directory.name).iterdir())
         self.assertNotIn(MESH_KEY, written)
         self.assertNotIn(WIZARD_KEY, written)
         self.assertNotIn("fixture-password", written)
+
+    def test_every_radio_command_gets_a_path(self):
+        self.stage("discover")
+        shells = [c for c in self.a.calls if c[:2] == ("file", "exec")]
+        self.assertTrue(shells)
+        for call in shells:
+            self.assertIn("/usr/bin", call[2]["env"]["PATH"])
+
+    def test_discover_says_when_commands_cannot_run(self):
+        for radio in (self.a, self.b):  # what a missing PATH would look like
+            radio.exec_replies = {"": {"code": 0, "stdout": "", "stderr": "sh: grep: not found"}}
+        status, report = self.stage("discover")
+        self.assertEqual(status, 1)
+        self.assertEqual(report["findings"]["commands_run"], {"a": False, "b": False})
+        self.assertTrue(report["findings"]["callers"]["a"].startswith(
+            "failed: /usr/sbin: exit 0: sh: grep: not found"))
+
+    def test_discover_tells_nothing_found_from_a_failure(self):
+        for radio in (self.a, self.b):
+            radio.exec_replies = {"ubus -v list": {"code": 0, "stdout": '"chswitch":{"count"}'},
+                                  "grep -rn": {"code": 0, "stdout": ""}}
+        status, report = self.stage("discover")
+        self.assertEqual(status, 0)
+        self.assertEqual(report["findings"]["callers"], {"a": "none", "b": "none"})
+        self.assertEqual(report["findings"]["signature"], {"a": "found", "b": "found"})
+
+    def test_discover_reports_a_refused_exec(self):
+        self.a.fail["file.exec"] = 6
+        status, report = self.stage("discover")
+        self.assertEqual(status, 1)
+        self.assertIn("permission denied", report["findings"]["callers"]["a"])
+        self.assertTrue(report["findings"]["callers"]["b"].startswith("found"))
+
+    def test_a_slow_place_times_out_alone_and_says_so(self):
+        timeout = RadioError("radio unreachable at fake: TimeoutError: timed out")
+        self.a.exec_replies = {"/www": timeout}
+        status, report = self.stage("discover")
+        callers = report["findings"]["callers"]["a"]
+        self.assertEqual(status, 0)
+        self.assertTrue(callers.startswith("found in /usr/sbin"))
+        self.assertIn("/www: no answer within", callers)
+        self.assertIn("slow command", callers)
+
+    def test_every_search_limits_itself_on_the_radio(self):
+        self.stage("discover")
+        searches = [c[2]["params"][1] for c in self.a.calls
+                    if c[:2] == ("file", "exec") and "grep -rn" in c[2]["params"][1]]
+        self.assertEqual(len(searches), len(radio_bench.CALLER_PLACES))
+        for command in searches:
+            self.assertIn(f"timeout {radio_bench.COMMAND_LIMIT} grep", command)
+        self.assertLess(radio_bench.COMMAND_LIMIT, radio_bench.EXEC_TIMEOUT)
 
     def test_capture_shows_peer_fields_through_the_service_mapping(self):
         status, report = self.stage("capture")
@@ -494,6 +554,46 @@ class WiringTests(unittest.TestCase):
         self.assertTrue(radio_bench.separate_paths("en5", "en7"))
         for pair in (("en5", "en5"), ("en5", None), (None, "en7"), (None, None)):
             self.assertFalse(radio_bench.separate_paths(*pair), pair)
+
+
+class RadioShellTests(unittest.TestCase):
+    """The search commands' own text, run by a real /bin/sh (dash on CI, close to the radio's
+    ash) against stub directories and a stub `timeout`. The fake radio never runs them."""
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        for name, text in (("hit/caller.sh", "ubus call message-system chswitch {}\n"),
+                           ("miss/other.sh", "nothing here\n")):
+            (self.root / name).parent.mkdir()
+            (self.root / name).write_text(text)
+        self.stubs = {"passes": '#!/bin/sh\nshift\nexec "$@"\n', "expires": "#!/bin/sh\nexit 124\n"}
+
+    def search(self, place, timeout=None):
+        bin_dir = self.root / f"bin-{timeout}"
+        bin_dir.mkdir(exist_ok=True)
+        if timeout:
+            stub = bin_dir / "timeout"
+            stub.write_text(self.stubs[timeout])
+            stub.chmod(0o755)
+        command = radio_bench.CALLER_SEARCH.format(limit=radio_bench.COMMAND_LIMIT,
+                                                   places=self.root / place)
+        done = subprocess.run(["/bin/sh", "-c", command], capture_output=True, text=True,
+                              env={"PATH": f"{bin_dir}:/usr/bin:/bin"})
+        return radio_bench.searched({"code": done.returncode, "stdout": done.stdout,
+                                     "stderr": done.stderr})
+
+    def test_found_and_none(self):
+        self.assertEqual(self.search("hit", "passes"), "found")
+        self.assertEqual(self.search("miss", "passes"), "none")
+
+    def test_a_timeout_is_a_failure_even_with_nothing_found(self):
+        self.assertEqual(self.search("miss", "expires"), "failed: exit 124: timed out after 25 s")
+
+    def test_a_missing_timeout_command_is_a_failure_not_none(self):
+        self.assertEqual(self.search("miss"), "failed: exit 127: timeout or grep is missing on "
+                                              "the radio")
 
 
 class OneWireTests(BenchCase):
