@@ -6,8 +6,8 @@ service: doodle
 name: mesh                      # rig instance / health identity; standalone compose project doodle_mesh
 # service/name/ros.namespace must match [a-z][a-z0-9_]*. Rig can supply name from vehicle.yaml.
 
-ros:
-  namespace: mesh               # defaults to name; the ROS node is /<namespace>/radio
+# ros:
+#   namespace: mesh             # defaults to name; the ROS node is /<namespace>/radio
 
 connection:
   type: ubus                    # the radio's JSON-RPC API (only supported transport)
