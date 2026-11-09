@@ -7,13 +7,60 @@ vehicle that can fly.
 
 | Question | Stage | Changes the radios | Read in `report.json` |
 |---|---|---|---|
+| Is everything working? | `check` | Only after the read-only checks pass and you agree | `checks` (also printed as it runs) |
 | How does the firmware call `chswitch`? | `discover` | No | `radios.a["vendor/callers"]`, `["vendor/strings"]`, `["config/…"]` |
 | What do peer entries hold, and does the service's mapping survive them? | `capture` | No | `peers`, `findings.not_published` |
 | How long does a switch take? Does it touch saved config or TX power? | `hop` | Yes | `findings.timing`, `findings.saved_config_rewritten`, `findings.tx_power_changed` |
 | What if one radio misses the switch? | `missed` | Yes | `findings.rejoined_by_itself`, `findings.b_landed_on` |
 | Do an RF toggle and a reboot bring a radio home? | `recover` | Yes | `findings.rf_toggle_returns_*_home`, `findings.reboot_returns_home` |
 
-## Setup
+## Quick check from a Mac wired to one radio
+
+Wire the Mac to radio a only. Radio b just needs power and the same mesh settings: the Mac reaches
+it through radio a's mesh link. The attenuation, authorization and stopped-service points under
+the two-wire setup below apply here too.
+
+Start read-only. It changes nothing:
+
+```bash
+python3 tools/radio_bench.py --a <radio-a> --b <radio-b> check --read-only
+```
+
+It checks, for both radios: API login and the permissions the service needs; firmware 2025-06 or
+later, and the same on both; RF on and the same channel and bandwidth; exactly one peer, with a
+signal that is neither too strong nor weak; data in both directions across the mesh; and the
+service's own code against each radio. That means the supervisor's read path and every diagnostic
+component the service would publish, including the values the dashboard relies on. Those are the
+outstanding hardware checks in [PLAN.md](PLAN.md).
+
+Without `--read-only`, once those all pass, it asks before making changes. Radio a's transmit power
+moves one supported step through the supervisor's own code, is read back, the link is checked at
+that power, and the power goes back. Radio a is always the wired one.
+
+```bash
+python3 tools/radio_bench.py --a <radio-a> --b <radio-b> check
+```
+
+Add `--to` and `--home` (built from `discover`, as below) and it also sends one `chswitch` request
+to radio a, checks that both radios moved and data crosses, then sends one to radio b to bring both
+back.
+
+```bash
+python3 tools/radio_bench.py --a <radio-a> --b <radio-b> check --to '<json>' --home '<json>'
+```
+
+On one wire, radio b's RF is never toggled: through the mesh, that would cut it off until a power
+cycle. If radio b is left on the test channel, the tool sends radio a there to fetch it. If that
+fails too, power-cycle radio b, unless the saved config moved (see "If a radio is stranded").
+`discover`, `capture` and `hop` also work on one wire; `missed` and `recover` refuse to run.
+
+The tool reads your routes to tell the setups apart. Two radios behind one local interface count as
+one wire, and so does a shared switch, which is not a supported setup: `chswitch` could reach radio
+b over Ethernet and look like an over-the-air switch.
+
+## Two-wire setup
+
+`missed` and `recover` need this; everything else also works with the quick check's single wire.
 
 1. **Give each radio its own wired path, never a shared switch.** `message-system` broadcasts on
    `br-mrlan`, the bridge that holds the wired port. On a shared LAN, `chswitch` can reach the other

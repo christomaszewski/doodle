@@ -21,7 +21,7 @@ hardware checks are listed in the plan.
 | `docker/entrypoints/health_ros.py` | The ROS node `/<namespace>/radio`: `/diagnostics` and the `tx_power` parameter |
 | `docker/compose/compose.deploy.yaml` | One container per radio; the password arrives as a compose secret the launcher writes |
 | `rigging.yaml` | Tells rig how to drive `doodle-up` |
-| `tools/radio_bench.py` | Two-radio bench for peer data and channel switching, run by hand; see [docs/RADIO_BENCH.md](docs/RADIO_BENCH.md) |
+| `tools/radio_bench.py` | Two-radio bench, run by hand: `check` that everything works from a Mac wired to one radio, plus peer data and channel switching; see [docs/RADIO_BENCH.md](docs/RADIO_BENCH.md) |
 
 Every change is live: nothing is written to the radio's flash, so a radio power cycle always
 restores its saved configuration.

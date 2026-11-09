@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 """Two-radio bench: the peer data and channel-switch behavior the service has never seen.
 
-  radio_bench.py --a HOST --b HOST discover | capture | hop | missed | recover
+  radio_bench.py --a HOST --b HOST check | discover | capture | hop | missed | recover
 
 Read docs/RADIO_BENCH.md first; this is for two radios on a bench, never a flying vehicle.
 
+- `check` answers "is everything working?", even from a machine wired to radio a alone: read-only
+  checks of both radios and of the service's own code against them, then (unless --read-only) a
+  power change on radio a and, given --to/--home, one mesh-wide channel switch each way.
 - `discover` and `capture` only read.
 - `hop`, `missed` and `recover` move real radios. They ask first, refuse a mesh with anyone else on
   it, and always finish by bringing both radios back to the home channel at their starting power.
+  `missed` and `recover` also need a wired path of its own to radio b.
 
 `message-system chswitch` is vendor code with undocumented arguments, so they are never guessed:
 `discover` shows how the firmware calls it, and --to/--home pass that JSON through unchanged.
@@ -22,12 +26,17 @@ from pathlib import Path
 import re
 import signal
 import statistics
+import subprocess
 import sys
+import tempfile
+import threading
 import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "docker" / "entrypoints"))
-from health import link_quality, peer_address  # noqa: E402
+import doodle_config  # noqa: E402
+from health import ERROR, OK, STALE, WARN, HealthReporter, link_quality, peer_address  # noqa: E402
 from radio_api import LINKSTATE, RadioAPI, RadioError, ReplyError  # noqa: E402
+import supervisor  # noqa: E402
 
 POLL = 0.25               # s between looks while a switch settles
 SAMPLE = 1.0              # s between link reports in `capture`
@@ -36,6 +45,11 @@ RF_TIMEOUT = 90.0         # s for RF to come back (docs/RADIO_API.md: observed <
 REBOOT_TIMEOUT = 240.0    # s for a radio to reboot and bring RF up
 EXEC_TIMEOUT = 30.0       # s for one `file exec`
 TOO_STRONG_DBM = -30      # Doodle's vehicle validation guide: may saturate the receiver
+WEAK_DBM, LOW_SNR_DB = -85, 10  # the same guide: a "bad" link below either
+OLDEST_FIRMWARE = (2025, 6)     # docs/RADIO_API.md: the oldest firmware the service supports
+FIRMWARE = re.compile(r"firmware-(\d{4})-(\d{2})")
+LEVEL_NAMES = {OK: "OK", WARN: "WARN", ERROR: "ERROR", STALE: "STALE"}
+NEEDS_WIRED_B = ("missed", "recover")  # they turn radio b's RF off or reboot it
 EXPECTED = {"link": ("link.signal_dbm", "link.snr_db", "link.loss_pct"),
             "mesh": ("mesh.quality_pct",)}
 SAVED_WIRELESS = "/etc/config/wireless"  # only ever `file stat`: its contents include the mesh key
@@ -109,6 +123,26 @@ def timing(rounds):
                 seen.setdefault(event, []).append(seconds)
     return {event: {"median_s": statistics.median(values), "max_s": max(values),
                     "count": len(values)} for event, values in sorted(seen.items())}
+
+
+def wired_interfaces(hosts, run=subprocess.run, platform=sys.platform):
+    """-> {host: the local interface that reaches it, or None}. Two radios behind one interface
+    share a path (one wire, or a shared switch), so radio b then counts as reachable only through
+    the mesh. An unknown answer counts the same way: it is the safe assumption."""
+    command = ["route", "-n", "get"] if platform == "darwin" else ["ip", "route", "get"]
+    found = {}
+    for host in hosts:
+        try:
+            output = run([*command, host], capture_output=True, text=True, timeout=5).stdout
+        except (OSError, subprocess.SubprocessError):
+            output = ""
+        match = re.search(r"interface:\s*(\S+)", output) or re.search(r"\bdev\s+(\S+)", output)
+        found[host] = match.group(1) if match else None
+    return found
+
+
+def separate_paths(a_path, b_path):
+    return None not in (a_path, b_path) and a_path != b_path
 
 
 class Log:
@@ -192,10 +226,15 @@ class Node:
 
 
 class Bench:
-    def __init__(self, a, b, log, *, to=None, home=None, timeout=90.0, ask=input,
-                 clock=time.monotonic, sleep=time.sleep):
+    """Both radios, and how this machine reaches them. Unless `separate`, radio b is reached only
+    through radio a's mesh link, so nothing here may cut b off: its RF is never toggled, and a
+    radio b left on another channel is fetched by sending radio a there."""
+
+    def __init__(self, a, b, log, *, to=None, home=None, timeout=90.0, separate=False,
+                 ask=input, clock=time.monotonic, sleep=time.sleep):
         self.a, self.b, self.nodes = a, b, (a, b)
         self.log, self.to, self.home, self.timeout = log, to, home, timeout
+        self.separate, self.wired = separate, (a, b) if separate else (a,)
         self.ask, self.clock, self.sleep = ask, clock, sleep
 
     def look(self, node):
@@ -291,18 +330,33 @@ class Bench:
             problems.append(f"radio a cannot ping {self.b.host} across the mesh")
         return power, problems, warnings
 
-    def confirm(self, stage):
-        print(f"\n{stage}: moves both radios between {self.home['frequency']} and "
-              f"{self.to['frequency']} MHz with `message-system chswitch`.\n"
-              "  - nothing is flying, and these two radios are the whole mesh\n"
-              "  - you are authorized to transmit on both frequencies\n"
-              "  - each radio has its own wired path; no shared switch (docs/RADIO_BENCH.md)\n"
-              "  - the doodle service is stopped on both radios")
+    def confirm(self, stage, changes):
+        wiring = ("each radio has its own wired path, and there is no shared switch"
+                  if self.separate else
+                  "only radio a is wired to this machine: b is reached through the mesh, and "
+                  "there is no shared switch")
+        print(f"\n{stage} will change real radios:", *(f"  * {line}" for line in changes),
+              "Agree only if:", "  - nothing is flying, and these two radios are the whole mesh",
+              "  - you are authorized to transmit on every frequency involved", f"  - {wiring}",
+              "  - the doodle service is stopped on both radios", sep="\n")
         return self.ask("Type yes to continue: ").strip().lower() == "yes"
 
+    def reachable(self, node):
+        return "error" not in self.look(node)
+
+    def controller(self, node, directory):
+        """The supervisor's own Controller on this radio, with a throwaway target file."""
+        stop = threading.Event()
+        stop.wait = lambda seconds: (self.sleep(seconds), stop.is_set())[1]
+        return supervisor.Controller(node.api, doodle_config.tx_power({}),
+                                     Path(directory) / "target.json", clock=self.clock,
+                                     stop_event=stop, sleep=self.sleep)
+
     def restore(self, power):
-        """Both radios home at their starting power, by the least invasive way that works."""
-        home, steps = self.home["frequency"], []
+        """Both radios home at their starting power, by the least invasive way that works. RF is
+        toggled only on a radio with a wired path of its own: through the mesh it would strand it.
+        With no --home (a `check` without a channel switch) only the power is put back."""
+        steps = []
 
         def attempt(what, action):
             try:
@@ -311,29 +365,48 @@ class Bench:
             except RadioError as error:
                 steps.append(f"{what} failed: {error}")
 
-        for node in self.nodes:
-            if self.look(node)["rf"] is False:
-                attempt(f"{node.name}: RF on", lambda: self.rf(node, True))
-        for node in self.nodes:  # `chswitch` first: it brings the mesh back together
-            if not self.on(node, home):
-                attempt(f"{node.name}: chswitch home", lambda: node.switch(self.home))
-                self.until(lambda: self.on(node, home), SETTLE)
-        for node in self.nodes:  # an RF toggle reloads the saved config
-            if not self.on(node, home):
-                def toggle():
-                    self.rf(node, False)
-                    self.rf(node, True)
-                attempt(f"{node.name}: RF toggle", toggle)
-                self.until(lambda: self.on(node, home), RF_TIMEOUT)
+        if self.home is not None:
+            home = self.home["frequency"]
+            for node in self.wired:
+                if self.look(node)["rf"] is False:
+                    attempt(f"{node.name}: RF on", lambda: self.rf(node, True))
+            for node in self.nodes:  # `chswitch` first: it brings the mesh back together
+                seen = self.look(node)
+                if seen["frequency"] != home and "error" not in seen:
+                    attempt(f"{node.name}: chswitch home", lambda: node.switch(self.home))
+                    self.until(lambda: self.on(node, home), SETTLE)
+            if not self.separate and not self.reachable(self.b):
+                self.rendezvous(attempt)
+            for node in self.wired:  # an RF toggle reloads the saved config
+                if not self.on(node, home):
+                    def toggle():
+                        self.rf(node, False)
+                        self.rf(node, True)
+                    attempt(f"{node.name}: RF toggle", toggle)
+                    self.until(lambda: self.on(node, home), RF_TIMEOUT)
         for node in self.nodes:
             wanted = power.get(node.name)
             if isinstance(wanted, int) and self.look(node)["tx_power"] != wanted:
                 attempt(f"{node.name}: tx power {wanted}", lambda: node.api.set_txpower(wanted))
         state = {node.name: self.look(node) for node in self.nodes}
-        at_home = all(seen["frequency"] == home for seen in state.values())
+        at_home = self.home is None or all(seen["frequency"] == self.home["frequency"]
+                                           for seen in state.values())
         return {"ok": at_home and all(seen["tx_power"] == power.get(name)
                                       for name, seen in state.items()),
                 "at_home": at_home, "steps": steps, "state": state}
+
+    def rendezvous(self, attempt):
+        """Radio b is reached only through the mesh, and the mesh is split: radio a goes to the
+        channel b was sent to, then brings both home from there."""
+        if self.to is None:
+            return
+        home = self.home["frequency"]
+        attempt(f"a: chswitch {self.to['frequency']} to find b", lambda: self.a.switch(self.to))
+        found = self.until(lambda: self.reachable(self.b), self.timeout) is not None
+        attempt("a: chswitch home" + ("" if found else " without b"),
+                lambda: self.a.switch(self.home))
+        self.until(lambda: self.on(self.a, home) and (not found or self.on(self.b, home)),
+                   SETTLE)
 
 
 # --- stages --------------------------------------------------------------------------------------
@@ -506,20 +579,241 @@ def recover(bench, args):
     return {"ok": ok, "findings": findings}
 
 
-STAGES = {"discover": discover, "capture": capture, "hop": hop, "missed": missed,
-          "recover": recover}
+# --- check: is everything working? ---------------------------------------------------------------
+
+class Checklist:
+    """PASS, WARN, FAIL, SKIP and NOTE lines: printed as they happen, kept for report.json."""
+
+    def __init__(self):
+        self.items = []
+
+    def add(self, status, name, detail=""):
+        self.items.append({"status": status, "check": name, "detail": detail})
+        print(f"{status:<4}  {name}" + (f": {detail}" if detail else ""), flush=True)
+
+    def failed(self):
+        return any(item["status"] == "FAIL" for item in self.items)
+
+
+def check(bench, args):
+    """Is everything working, from this machine? Read-only checks first. Changes come only after
+    they all pass and you agree, and both radios are put back however it ends."""
+    items = Checklist()
+    if (bench.to is None) != (bench.home is None):
+        items.add("FAIL", "arguments", "pass both --to and --home, or neither")
+        return {"ok": False, "checks": items.items}
+    items.add("NOTE", "wiring", "each radio has its own wired path" if bench.separate else
+              "only radio a is wired here: radio b is reached through the mesh")
+    seen = read_checks(bench, items)
+    if args.read_only or items.failed() or len(seen) < 2:
+        why = "--read-only" if args.read_only else "a check above failed"
+        items.add("SKIP", "power and channel changes", why)
+        return {"ok": not items.failed(), "checks": items.items}
+    changes = ["radio a's transmit power moves one supported step and back"]
+    if bench.to is not None:
+        changes.append(f"both radios switch to {bench.to['frequency']} MHz and back, with one "
+                       "`message-system chswitch` request each way")
+    if not (args.yes or bench.confirm("check", changes)):
+        items.add("SKIP", "power and channel changes", "not confirmed")
+        return {"ok": not items.failed(), "checks": items.items}
+    power = {name: view["tx_power"] for name, view in seen.items()}
+    try:
+        power_round_trip(bench, items)
+        if bench.to is not None:
+            channel_round_trip(bench, items)
+        else:
+            items.add("SKIP", "mesh-wide channel switch",
+                      "pass --to and --home, built from what `discover` shows")
+    except (Exception, KeyboardInterrupt) as error:  # whatever happened, the radios go home
+        items.add("FAIL", "changes", f"{type(error).__name__}: {error}")
+    restored = bench.restore(power)
+    items.add("PASS" if restored["ok"] else "FAIL", "both radios back where they started",
+              "; ".join(restored["steps"]))
+    return {"ok": not items.failed(), "checks": items.items, "restored": restored}
+
+
+def read_checks(bench, items):
+    """-> {radio: how it looks now}, for each radio that is reachable with RF on."""
+    seen, firmware, reports = {}, {}, {}
+    for node in bench.nodes:
+        try:
+            missing = node.api.missing_permissions("observe", "set_power", "rf_toggle")
+            board = node.api.board()
+        except RadioError as error:
+            hint = ("" if bench.separate or node is bench.a else
+                    " (radio b is reached through the mesh: is the link up?)")
+            items.add("FAIL", f"{node.name}: reach and log in", f"{error}{hint}")
+            continue
+        items.add("FAIL" if missing else "PASS", f"{node.name}: API login and permissions",
+                  ", ".join(missing))
+        firmware[node.name] = board.get("firmware") or ""
+        match = FIRMWARE.search(firmware[node.name])
+        new_enough = bool(match) and (int(match[1]), int(match[2])) >= OLDEST_FIRMWARE
+        items.add("PASS" if new_enough else "FAIL", f"{node.name}: firmware 2025-06 or later",
+                  firmware[node.name] or "unknown")
+        view = bench.look(node)
+        if view["rf"] is not True:
+            items.add("FAIL", f"{node.name}: RF on", view.get("error", "RF off"))
+            continue
+        seen[node.name] = view
+        try:
+            reports[node.name] = node.report()
+        except RadioError as error:
+            items.add("FAIL", f"{node.name}: link report", str(error))
+    if len(seen) < 2:
+        return seen
+    if len(set(firmware.values())) > 1:
+        items.add("WARN", "same firmware", ", ".join(f"{k} {v}" for k, v in firmware.items()))
+    widths = {name: str(report.get("chan_width")) for name, report in reports.items()}
+    same = seen["a"]["frequency"] == seen["b"]["frequency"] and len(set(widths.values())) < 2
+    items.add("PASS" if same else "FAIL", "same channel", ", ".join(
+        f"{name} {view['frequency']} MHz, {widths.get(name)} MHz wide"
+        for name, view in seen.items()))
+    for name, report in reports.items():
+        link_checks(name, report, items)
+    for source, target in ((bench.a, bench.b), (bench.b, bench.a)):
+        items.add("PASS" if source.ping(target.host) else "FAIL",
+                  f"data {source.name} -> {target.name} across the mesh")
+    for node in bench.nodes:
+        service_checks(bench, node, seen[node.name], items)
+    return seen
+
+
+def link_checks(name, report, items):
+    peers = peer_count(report)
+    items.add("PASS" if peers == 1 else "FAIL" if peers == 0 else "WARN", f"{name}: peers",
+              f"hears {peers}; expected the other radio only")
+    for entry in report.get("sta_stats") or []:
+        quality = link_quality("link", entry, report.get("noise"))
+        signal_dbm, snr = quality.get("link.signal_dbm"), quality.get("link.snr_db")
+        detail = f"{signal_dbm} dBm" + (f", SNR {snr} dB" if snr is not None else "")
+        if signal_dbm is None:
+            status, detail = "WARN", "no signal the service can map from " + ", ".join(entry)
+        elif signal_dbm >= TOO_STRONG_DBM:
+            status, detail = "WARN", detail + " (too strong: may saturate the receiver)"
+        elif signal_dbm < WEAK_DBM or (snr is not None and snr < LOW_SNR_DB):
+            status, detail = "WARN", detail + " (weak)"
+        else:
+            status = "PASS"
+        items.add(status, f"{name}: signal from {peer_address(entry) or 'a peer'}", detail)
+    for kind, field in (("link", "sta_stats"), ("mesh", "mesh_stats")):
+        entries = [(entry, report.get("noise")) for entry in report.get(field) or []]
+        if entries:
+            missing = inventory(entries, kind)["not_published"]
+            items.add("WARN" if missing else "PASS", f"{name}: {kind} keys the dashboard reads",
+                      "missing " + ", ".join(missing) if missing else ", ".join(EXPECTED[kind]))
+
+
+def service_checks(bench, node, view, items):
+    """The service's own read path against this radio: the supervisor's observation and the
+    diagnostics it would publish, without ROS (docs/PLAN.md, hardware checks for Phase 3)."""
+    try:
+        with tempfile.TemporaryDirectory() as directory:
+            controller = bench.controller(node, directory)
+            snapshot = controller.status()
+        reporter = HealthReporter(node.name, clock=bench.clock)
+        reporter.poll(node.api)
+        rows = reporter.snapshot(controller.health_state())
+    except Exception as error:  # the service's code failing against real replies is the finding
+        items.add("FAIL", f"{node.name}: service code", f"{type(error).__name__}: {error}")
+        return
+    items.add("FAIL" if snapshot.get("error") else "PASS", f"{node.name}: supervisor read path",
+              snapshot.get("error") or f"RF {snapshot['rf']}, {snapshot['tx_power_dbm']} dBm, "
+              f"supported {snapshot['range_dbm']}")
+    components = {row["name"].split(": ", 1)[-1]: row for row in rows}
+    not_ok = [f"{name} {LEVEL_NAMES[row['level']]}: {row['message']}"
+              for name, row in components.items() if row["level"] != OK]
+    worst = max((row["level"] for row in components.values()), default=STALE)
+    items.add("FAIL" if worst in (ERROR, STALE) else "WARN" if not_ok else "PASS",
+              f"{node.name}: diagnostics the service would publish",
+              "; ".join(not_ok) or ", ".join(sorted(components)))
+    radio = components.get("radio", {}).get("values", {})
+    links = components.get("links", {}).get("values", {})
+
+    def measured_or_unsupported(key):
+        value = radio.get(key)
+        return isinstance(value, (int, float)) or \
+            radio.get(f"health.metric.{key}.state") == "unsupported"
+
+    expectations = {
+        "rf.tx_power_dbm matches": radio.get("rf.tx_power_dbm") == view["tx_power"],
+        "rf.noise_dbm": isinstance(radio.get("rf.noise_dbm"), (int, float)),
+        "rf.ack_power_dbm": measured_or_unsupported("rf.ack_power_dbm"),
+        "rf.tx_airtime_pct": measured_or_unsupported("rf.tx_airtime_pct"),
+        "links.stations": (links.get("links.stations") or 0) >= 1,
+        "link.signal_dbm": any("link.signal_dbm" in row["values"]
+                               for name, row in components.items() if name.startswith("link/"))}
+    wrong = [key for key, ok in expectations.items() if not ok]
+    items.add("WARN" if wrong else "PASS", f"{node.name}: values the dashboard depends on",
+              "not as expected: " + ", ".join(wrong) if wrong else ", ".join(expectations))
+
+
+def power_round_trip(bench, items):
+    """The supervisor's write path on radio a, which is always wired: one supported step down
+    (or up), read back, the link checked, then back. The same calls as `doodle-up … tx-power`."""
+    a = bench.a
+    with tempfile.TemporaryDirectory() as directory:
+        controller = bench.controller(a, directory)
+        before = controller.status()["tx_power_dbm"]
+        supported = a.api.txpower_list()
+        if not isinstance(before, int) or len(supported) < 2:
+            items.add("SKIP", "a: transmit power change", f"at {before} dBm of {supported}")
+            return
+        lower = [dbm for dbm in supported if dbm < before]
+        step = lower[-1] if lower else min(dbm for dbm in supported if dbm > before)
+        changed = controller.request(step)
+        applied = changed["converged"] and changed["tx_power_dbm"] == step
+        items.add("PASS" if applied else "FAIL", "a: transmit power change",
+                  f"{before} -> {changed['tx_power_dbm']} dBm, read back")
+        crossed = bench.until(lambda: a.ping(bench.b.host), 10)
+        items.add("PASS" if crossed is not None else "WARN", f"link at {step} dBm",
+                  f"data after {crossed} s" if crossed is not None else
+                  "no data for 10 s: a live power change may interrupt the link")
+        back = controller.request(before)
+        items.add("PASS" if back["tx_power_dbm"] == before else "FAIL",
+                  "a: transmit power restored", f"{back['tx_power_dbm']} dBm")
+
+
+def channel_round_trip(bench, items):
+    """One `chswitch` request to radio a should move both radios; one to radio b, both back."""
+    _, problems, _ = bench.preflight()
+    if problems:
+        items.add("SKIP", "mesh-wide channel switch", "; ".join(problems))
+        return
+    for sender, target in ((bench.a, bench.to), (bench.b, bench.home)):
+        events = bench.move(sender, target)
+        name = f"one request to {sender.name} moves both radios to {target['frequency']} MHz"
+        if "data" not in events:
+            items.add("FAIL", name, json.dumps(events))
+            return
+        items.add("PASS", name, f"data after {events['data']} s")
+
+
+STAGES = {"check": check, "discover": discover, "capture": capture, "hop": hop,
+          "missed": missed, "recover": recover}
 ACTIVE = ("hop", "missed", "recover")
 
 
 def run(bench, args):
     """-> exit status: 0 done, 1 a finding or a refusal, 3 radios not restored."""
     stage = STAGES[args.stage]
+    if args.stage == "check":
+        report = stage(bench, args)
+        bench.log.report(report)
+        print(f"report: {bench.log.directory}")
+        return outcome(report)
     if args.stage not in ACTIVE:
         report = stage(bench, args)
         bench.log.report(report)
         print(json.dumps(report["findings"], indent=2, default=str))
         print(f"report: {bench.log.directory}")
         return 0 if report["ok"] else 1
+    if args.stage in NEEDS_WIRED_B and not bench.separate:
+        problem = (f"{args.stage} turns radio b's RF off or reboots it, so it needs a wired path "
+                   "of its own to radio b; here b is reached only through the mesh")
+        bench.log.report({"ok": False, "refused": [problem]})
+        print("refused, nothing was changed:", problem, sep="\n  ", file=sys.stderr)
+        return 1
     power, problems, warnings = bench.preflight()
     for warning in warnings:
         print(f"warning: {warning}", file=sys.stderr)
@@ -527,7 +821,9 @@ def run(bench, args):
         bench.log.report({"ok": False, "refused": problems})
         print("refused, nothing was changed:", *problems, sep="\n  ", file=sys.stderr)
         return 1
-    if not (args.yes or bench.confirm(args.stage)):
+    move = (f"both radios move between {bench.home['frequency']} and {bench.to['frequency']} MHz "
+            "with `message-system chswitch`")
+    if not (args.yes or bench.confirm(args.stage, [move])):
         print("cancelled, nothing was changed", file=sys.stderr)
         return 1
     try:
@@ -538,8 +834,12 @@ def run(bench, args):
     bench.log.report(report)
     print(json.dumps(report["findings"], indent=2, default=str))
     print(f"report: {bench.log.directory}")
-    restored = report["restored"]
-    if restored["ok"]:
+    return outcome(report)
+
+
+def outcome(report):
+    restored = report.get("restored")
+    if restored is None or restored["ok"]:
         return 0 if report["ok"] else 1
     print(f"NOT RESTORED: {json.dumps(restored['state'], default=str)}\n"
           "See 'If a radio is stranded' in docs/RADIO_BENCH.md. A power cycle reloads the saved "
@@ -556,6 +856,13 @@ def parser():
     top.add_argument("--uci-radio", default="radio0")
     top.add_argument("--out", default="var/bench", help="directory for runs (gitignored default)")
     stages = top.add_subparsers(dest="stage", required=True)
+    stage = stages.add_parser("check", help="is everything working: read-only checks, then a "
+                              "power change and, with --to/--home, one channel switch each way")
+    stage.add_argument("--to", type=switch_args, help="chswitch JSON to the test channel")
+    stage.add_argument("--home", type=switch_args, help="chswitch JSON back home")
+    stage.add_argument("--read-only", action="store_true", help="stop after the read-only checks")
+    stage.add_argument("--timeout", type=float, default=90, help="s to wait for one switch")
+    stage.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
     stages.add_parser("discover", help="read-only: firmware, frequencies, how chswitch is called")
     stage = stages.add_parser("capture", help="read-only: real per-peer data")
     stage.add_argument("--seconds", type=float, default=60)
@@ -597,10 +904,14 @@ def main(argv=None):
     a, b = [Node(name, RadioAPI(host, args.username, password, device=args.device,
                                 uci_radio=args.uci_radio), host)
             for name, host, password in (("a", args.a, first), ("b", args.b, second))]
+    paths = wired_interfaces((args.a, args.b))
+    separate = separate_paths(paths[args.a], paths[args.b])
+    print(f"wiring: a via {paths[args.a] or '?'}, b via {paths[args.b] or '?'}: "
+          + ("separate paths" if separate else "radio b counts as reachable only through the mesh"))
     stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
     bench = Bench(a, b, Log(Path(args.out) / f"{stamp}-{args.stage}"),
                   to=getattr(args, "to", None), home=getattr(args, "home", None),
-                  timeout=getattr(args, "timeout", 90.0))
+                  timeout=getattr(args, "timeout", 90.0), separate=separate)
     try:
         return run(bench, args)
     except KeyboardInterrupt:  # only reachable by interrupting preflight or restore() itself

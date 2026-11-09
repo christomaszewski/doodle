@@ -8,6 +8,7 @@ from pathlib import Path
 import signal
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -44,6 +45,9 @@ class BenchRadio(FakeRadio):
         self.link_broken = False        # up on one frequency, but they never peer
         self.no_data_on = set()         # frequencies that peer but pass no traffic
         self.assoclist_empty = False    # mesh peers may not be listed there at all
+        self.reached_through = None     # radio b on a one-wire bench: reachable only when linked
+        self.misses, self.heard = set(), 0  # which of the peer's switches this radio fails to hear
+        self.firmware = "firmware-2026-03.1"
 
     def linked(self):
         return (self.peer is not None and self.rf_up and self.peer.rf_up
@@ -58,6 +62,8 @@ class BenchRadio(FakeRadio):
         if self.down_polls:
             self.down_polls -= 1
             raise RadioError("radio unreachable at fake: rebooting")
+        if self.reached_through is not None and not self.linked():
+            raise RadioError("radio unreachable at fake: no route through the mesh")
         return super().__call__(payload, timeout)
 
     def _method(self, obj, method, args):
@@ -67,7 +73,9 @@ class BenchRadio(FakeRadio):
             hearing = self.linked()
             self._tune(args["frequency"])
             if hearing:
-                self.peer._tune(args["frequency"])
+                self.peer.heard += 1
+                if self.peer.heard not in self.peer.misses:
+                    self.peer._tune(args["frequency"])
             if self.persists:
                 self.saved_frequency = args["frequency"]
                 self.config_mtime += 1
@@ -77,6 +85,10 @@ class BenchRadio(FakeRadio):
                 self._drift_home()
             listed = self.linked() and not self.assoclist_empty
             return {"results": [{"mac": self.peer.mac}] if listed else []}
+        if (obj, method) == ("system", "board"):
+            board = super()._method(obj, method, args)
+            board["release"]["version"] = self.firmware
+            return board
         if obj == "iwinfo" and method == "freqlist":
             return {"results": [{"channel": f - 2399, "mhz": f} for f in range(2400, 2506)]}
         if (obj, method) == ("file", "stat"):
@@ -140,13 +152,29 @@ class BenchCase(unittest.TestCase):
         self.addCleanup(self.directory.cleanup)
         self.clock = Clock()
         self.answers = ["yes"]
+        self.separate = True  # each radio wired on its own; OneWire cases switch this off
+
+    def one_wire(self):
+        self.separate, self.b.reached_through = False, self.a
 
     def bench(self, **overrides):
         nodes = [Node(name, RadioAPI("fake", "user", "fixture-password", transport=radio), host)
                  for name, radio, host in (("a", self.a, "radio-a"), ("b", self.b, "radio-b"))]
         options = {"to": TO, "home": BACK, "timeout": 30.0, "ask": lambda _: self.answers.pop(0),
-                   "clock": self.clock, "sleep": self.clock.sleep, **overrides}
+                   "clock": self.clock, "sleep": self.clock.sleep, "separate": self.separate,
+                   **overrides}
         return Bench(*nodes, Log(self.directory.name, self.clock), **options)
+
+    def changes(self, radio):
+        """Every call that could change the radio (`/bin/sh` runs only ping and read commands)."""
+        return [call for call in radio.calls
+                if call[:2] in (("message-system", "chswitch"), ("network.wireless", "up"),
+                                ("network.wireless", "down"), ("system", "reboot"))
+                or (call[:2] == ("file", "exec") and call[2]["command"] != "/bin/sh")]
+
+    def rf_toggles(self, radio):
+        return [call for call in radio.calls if call[0] == "network.wireless"
+                and call[1] in ("up", "down")]
 
     def stage(self, name, **values):
         defaults = {"hop": {"repeats": 2, "dwell": 1.0}, "missed": {"watch": 20.0},
@@ -439,6 +467,227 @@ class RecoverTests(BenchCase):
         self.assertEqual(status, 0)
         self.assertNotIn("reboot_returns_home", report["findings"])
         self.assertFalse([c for c in self.a.calls if c[:2] == ("system", "reboot")])
+
+
+class WiringTests(unittest.TestCase):
+    def paths(self, outputs, platform):
+        def run(command, **_):
+            if outputs[command[-1]] is None:
+                raise OSError("no such command")
+            return SimpleNamespace(stdout=outputs[command[-1]])
+        return radio_bench.wired_interfaces(list(outputs), run=run, platform=platform)
+
+    def test_macos_route_output(self):
+        found = self.paths({"radio-a": "   route to: 10.1.0.1\n  interface: en5\n",
+                            "radio-b": "  interface: en7\n"}, "darwin")
+        self.assertEqual(found, {"radio-a": "en5", "radio-b": "en7"})
+
+    def test_linux_route_output(self):
+        found = self.paths({"10.1.0.1": "10.1.0.1 dev eth1 src 10.1.0.9 uid 501\n"}, "linux")
+        self.assertEqual(found, {"10.1.0.1": "eth1"})
+
+    def test_an_unknown_path_is_none_so_the_safe_mode_applies(self):
+        found = self.paths({"radio-a": None, "radio-b": "nothing useful"}, "darwin")
+        self.assertEqual(found, {"radio-a": None, "radio-b": None})
+
+    def test_only_two_known_different_interfaces_count_as_separate(self):
+        self.assertTrue(radio_bench.separate_paths("en5", "en7"))
+        for pair in (("en5", "en5"), ("en5", None), (None, "en7"), (None, None)):
+            self.assertFalse(radio_bench.separate_paths(*pair), pair)
+
+
+class OneWireTests(BenchCase):
+    """Radio b reached only through radio a's mesh link: nothing may cut b off."""
+
+    def setUp(self):
+        super().setUp()
+        self.one_wire()
+
+    def test_hop_works_over_one_wire(self):
+        status, report = self.stage("hop")
+        self.assertEqual(status, 0)
+        self.assertEqual(report["findings"]["switches_completed"], "4/4")
+        self.assertHome()
+
+    def test_a_radio_b_left_behind_is_fetched_by_sending_a_to_it(self):
+        self.b.misses = {2}  # b misses the last switch home, sent from a
+        status, report = self.stage("hop", repeats=2)
+        self.assertEqual(status, 1)
+        self.assertTrue(report["restored"]["ok"])
+        self.assertIn(f"a: chswitch {TEST} to find b", report["restored"]["steps"])
+        self.assertHome()
+        self.assertEqual(self.rf_toggles(self.b), [])
+
+    def test_radio_b_is_never_rf_toggled_even_when_it_cannot_be_fetched(self):
+        self.b.misses = set(range(2, 20))
+        status, report = self.stage("hop", repeats=2)
+        self.assertEqual(status, 3)
+        self.assertEqual(self.b.frequency, TEST)
+        self.assertEqual(self.a.frequency, HOME)
+        self.assertEqual(self.rf_toggles(self.b), [])
+
+    def test_radio_b_is_never_rf_toggled_while_it_is_still_reachable(self):
+        # Both stuck on the test channel: a's RF toggle reloads a saved config the switch wrote,
+        # so b stays reachable there. Toggling b now would cut it off until a power cycle.
+        self.a.persists = True
+        self.a.ignores_home = self.b.ignores_home = True
+        status, report = self.stage("hop", repeats=1)
+        self.assertEqual(status, 3)
+        self.assertTrue(self.rf_toggles(self.a))
+        self.assertEqual(self.rf_toggles(self.b), [])
+
+    def test_missed_and_recover_need_a_wire_to_b(self):
+        for stage in ("missed", "recover"):
+            status, report = self.stage(stage)
+            self.assertEqual(status, 1)
+            self.assertIn("wired path", report["refused"][0])
+        self.assertEqual(self.changes(self.a) + self.changes(self.b), [])
+
+
+class CheckTests(BenchCase):
+    """From a Mac wired to radio a only, with radio b on and meshed."""
+
+    def setUp(self):
+        super().setUp()
+        self.one_wire()
+
+    def check(self, read_only=False, **overrides):
+        options = {"to": None, "home": None, **overrides}
+        args = argparse.Namespace(stage="check", read_only=read_only, yes=False)
+        status = run(self.bench(**options), args)
+        return status, {item["check"]: item for item in self.report()["checks"]}
+
+    @staticmethod
+    def having(checks, status):
+        return [name for name, item in checks.items() if item["status"] == status]
+
+    def test_read_only_passes_on_a_healthy_pair_and_changes_nothing(self):
+        status, checks = self.check(read_only=True)
+        self.assertEqual(status, 0)
+        self.assertEqual(self.having(checks, "FAIL") + self.having(checks, "WARN"), [])
+        for name in ("a: diagnostics the service would publish",
+                     "b: values the dashboard depends on", "data b -> a across the mesh",
+                     "b: supervisor read path", "same channel"):
+            self.assertEqual(checks[name]["status"], "PASS", name)
+        self.assertIn("through the mesh", checks["wiring"]["detail"])
+        self.assertEqual(checks["power and channel changes"]["detail"], "--read-only")
+        self.assertEqual(self.changes(self.a) + self.changes(self.b), [])
+
+    def test_radio_b_unreachable_through_the_mesh_is_a_failure_and_nothing_changes(self):
+        self.a.link_broken = self.b.link_broken = True
+        status, checks = self.check()
+        self.assertEqual(status, 1)
+        self.assertIn("is the link up?", checks["b: reach and log in"]["detail"])
+        self.assertEqual(checks["power and channel changes"]["status"], "SKIP")
+        self.assertEqual(self.changes(self.a), [])
+
+    def test_old_firmware_and_missing_permissions_fail(self):
+        self.b.firmware = "firmware-2023-09.03"
+        self.a.acls = {"ubus": {"system": ["info", "board"]}}
+        status, checks = self.check(read_only=True)
+        self.assertEqual(status, 1)
+        self.assertEqual(checks["a: API login and permissions"]["status"], "FAIL")
+        self.assertEqual(checks["b: firmware 2025-06 or later"]["status"], "FAIL")
+        self.assertEqual(checks["same firmware"]["status"], "WARN")
+
+    def test_a_too_strong_signal_warns_without_failing(self):
+        self.a.rssi = -25
+        status, checks = self.check(read_only=True)
+        self.assertEqual(status, 0)
+        self.assertIn("too strong", checks["a: signal from 00:30:1a:00:00:0b"]["detail"])
+
+    def test_peer_fields_the_service_cannot_map_are_called_out(self):
+        self.b.rssi = 45  # a vendor scale, not dBm
+        status, checks = self.check(read_only=True)
+        self.assertEqual(status, 0)
+        self.assertIn("no signal the service can map",
+                      checks["b: signal from 00:30:1a:00:00:0a"]["detail"])
+        self.assertIn("link.signal_dbm", checks["b: link keys the dashboard reads"]["detail"])
+        self.assertIn("link.signal_dbm", checks["b: values the dashboard depends on"]["detail"])
+
+    def test_power_moves_one_step_through_the_supervisor_and_back(self):
+        status, checks = self.check()
+        self.assertEqual(status, 0)
+        self.assertEqual(checks["a: transmit power change"]["detail"], "25 -> 24 dBm, read back")
+        self.assertEqual(checks["link at 24 dBm"]["status"], "PASS")
+        self.assertEqual(checks["a: transmit power restored"]["status"], "PASS")
+        self.assertEqual(checks["mesh-wide channel switch"]["status"], "SKIP")
+        self.assertEqual([call[2]["params"][-1] for call in self.changes(self.a)], ["2400", "2500"])
+        self.assertEqual(self.changes(self.b), [])
+        self.assertEqual(checks["both radios back where they started"]["detail"], "")
+        self.assertHome()
+
+    def test_any_failure_stops_before_changes(self):
+        self.b.firmware = "firmware-2023-09.03"
+        status, checks = self.check()
+        self.assertEqual(status, 1)
+        self.assertEqual(checks["power and channel changes"]["detail"], "a check above failed")
+        self.assertEqual(self.answers, ["yes"])  # never asked
+        self.assertEqual(self.changes(self.a) + self.changes(self.b), [])
+
+    def test_a_link_that_carries_no_data_fails(self):
+        self.a.no_data_on = {HOME}
+        status, checks = self.check(read_only=True)
+        self.assertEqual(status, 1)
+        self.assertEqual(checks["data a -> b across the mesh"]["status"], "FAIL")
+        self.assertEqual(checks["data b -> a across the mesh"]["status"], "PASS")
+
+    def test_a_service_component_that_would_be_stale_fails(self):
+        self.a.fail["system.info"] = 9
+        status, checks = self.check(read_only=True)
+        self.assertEqual(status, 1)
+        self.assertEqual(checks["a: diagnostics the service would publish"]["status"], "FAIL")
+        self.assertIn("system STALE", checks["a: diagnostics the service would publish"]["detail"])
+
+    def test_a_failed_return_is_put_right_by_restore(self):
+        self.b.ignores_home = True  # b takes no request home, but still follows a's
+        status, checks = self.check(to=TO, home=BACK)
+        self.assertEqual(status, 1)
+        self.assertEqual(checks[f"one request to b moves both radios to {HOME} MHz"]["status"],
+                         "FAIL")
+        self.assertIn("a: chswitch home", checks["both radios back where they started"]["detail"])
+        self.assertHome()
+
+    def test_declining_leaves_everything_alone(self):
+        self.answers = ["no"]
+        status, checks = self.check()
+        self.assertEqual(status, 0)
+        self.assertEqual(self.answers, [])
+        self.assertEqual(checks["power and channel changes"]["detail"], "not confirmed")
+        self.assertEqual(self.changes(self.a) + self.changes(self.b), [])
+
+    def test_one_request_from_either_end_moves_both_radios(self):
+        status, checks = self.check(to=TO, home=BACK)
+        self.assertEqual(status, 0)
+        self.assertEqual(checks[f"one request to a moves both radios to {TEST} MHz"]["status"],
+                         "PASS")
+        self.assertEqual(checks[f"one request to b moves both radios to {HOME} MHz"]["status"],
+                         "PASS")
+        self.assertEqual(self.switches(self.a)[0][2], TO)
+        self.assertEqual(self.switches(self.b)[0][2], BACK)
+        self.assertHome()
+
+    def test_a_switch_that_moves_nothing_fails_and_leaves_both_home(self):
+        self.a.deaf = self.b.deaf = True
+        status, checks = self.check(to=TO, home=BACK)
+        self.assertEqual(status, 1)
+        self.assertEqual(checks[f"one request to a moves both radios to {TEST} MHz"]["status"],
+                         "FAIL")
+        self.assertEqual(checks["both radios back where they started"]["status"], "PASS")
+        self.assertHome()
+
+    def test_a_power_change_the_radio_ignores_fails_and_is_cleaned_up(self):
+        self.a.ignore_txpower = True
+        status, checks = self.check()
+        self.assertEqual(status, 1)
+        self.assertEqual(checks["changes"]["status"], "FAIL")
+        self.assertEqual(checks["both radios back where they started"]["status"], "PASS")
+
+    def test_to_without_home_is_refused(self):
+        status, checks = self.check(to=TO)
+        self.assertEqual(status, 1)
+        self.assertEqual(checks["arguments"]["status"], "FAIL")
+        self.assertEqual(self.changes(self.a) + self.changes(self.b), [])
 
 
 class CommandLineTests(BenchCase):
