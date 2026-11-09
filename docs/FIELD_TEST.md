@@ -138,8 +138,9 @@ SNR lines; record a bag of each so the noise floor can be compared from the snap
 
 **Pattern, per channel: a hover-and-rotate ladder.** At 3 altitudes (e.g. 30, 60, 90 m), hover and
 yaw a full turn at about 12°/s, then climb or descend at about 1 m/s to the next: about 150 s.
-Alternate up and down ladders. Order: home channel climbing, 3–4 test channels, home channel
-descending (the two home ladders measure the climb-versus-descent difference). Fly 300–500 m from
+Alternate up and down ladders. Order: home channel climbing, an even number of test channels (2 or
+4), home channel descending; the two home ladders measure the climb-versus-descent difference, and
+an odd count would make the last one climb too. Fly 300–500 m from
 the GCS with line of sight, and note the GCS antenna's position and height. Hold at the end of
 each ladder for the switch.
 
@@ -159,11 +160,15 @@ python3 tools/radio_bench.py --a $GCS --b $VEHICLE check --read-only
 **In flight**, fly the two home-channel ladders without the tool. For each test channel, while
 holding before its ladder, run this and type `yes`. Start the ladder when it prints
 `switch to <MHz> … both radios there`; after the dwell it switches both radios home by itself and
-prints the result.
+prints the result. Hold until it has, then start the next channel's command. `--dwell` is the
+ladder's duration plus about 15 s, so the switch home happens during the hold, not the last turn.
 
 ```bash
-python3 tools/radio_bench.py --a $GCS --b $VEHICLE hop --to "$(sw <channel-mhz>)" --home "$(sw $HOME_MHZ)" --repeats 1 --dwell 150
+python3 tools/radio_bench.py --a $GCS --b $VEHICLE hop --to "$(sw <channel-mhz>)" --home "$(sw $HOME_MHZ)" --repeats 1 --dwell 165
 ```
+
+Allow 20–30 s per hold until 3.3 has shown the real switch times. Have the bag logger running on
+the vehicle before takeoff.
 
 **After landing:**
 
