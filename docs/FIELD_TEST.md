@@ -136,13 +136,15 @@ SNR lines; record a bag of each so the noise floor can be compared from the snap
 
 ## 5. Flight
 
-**Pattern, per channel: a hover-and-rotate ladder.** At 3 altitudes (e.g. 30, 60, 90 m), hover and
-yaw a full turn at about 12°/s, then climb or descend at about 1 m/s to the next: about 150 s.
-Alternate up and down ladders. Order: home channel climbing, an even number of test channels (2 or
-4), home channel descending; the two home ladders measure the climb-versus-descent difference, and
-an odd count would make the last one climb too. Fly 300–500 m from
-the GCS with line of sight, and note the GCS antenna's position and height. Hold at the end of
-each ladder for the switch.
+**Pattern, per channel: a corkscrew up and back down**, under this test's 30 m ceiling. From a
+hold at 10 m, climb to 30 m at about 0.33 m/s while yawing at about 12°/s (about 60 s, two full
+turns), hover at 30 m for one more full turn (30 s), then corkscrew back down to 10 m the same way:
+about 150 s. Every channel gets a climb and a descent, so the extra motor noise of climbing is in
+every channel's data equally instead of looking like a channel difference; the hover turn at the
+top is a clean equal-throttle comparison. Order: home channel, the test channels (4 is about 12
+minutes with holds), then home again to show drift over the flight. Fly 300–500 m from the GCS
+with line of sight, and note the GCS antenna's position and height. Hold at 10 m between channels
+for the switch.
 
 **Before takeoff**, set the GCS radio to the same fixed power (live only: a power cycle restores
 its saved power):
@@ -157,11 +159,11 @@ Then confirm both radios, on the ground:
 python3 tools/radio_bench.py --a $GCS --b $VEHICLE check --read-only
 ```
 
-**In flight**, fly the two home-channel ladders without the tool. For each test channel, while
-holding before its ladder, run this and type `yes`. Start the ladder when it prints
+**In flight**, fly the two home-channel corkscrews without the tool. For each test channel, while
+holding at 10 m, run this and type `yes`. Start the corkscrew when it prints
 `switch to <MHz> … both radios there`; after the dwell it switches both radios home by itself and
 prints the result. Hold until it has, then start the next channel's command. `--dwell` is the
-ladder's duration plus about 15 s, so the switch home happens during the hold, not the last turn.
+corkscrew's 150 s plus about 15 s, so the switch home happens during the hold, not the last turn.
 
 ```bash
 python3 tools/radio_bench.py --a $GCS --b $VEHICLE hop --to "$(sw <channel-mhz>)" --home "$(sw $HOME_MHZ)" --repeats 1 --dwell 165
