@@ -405,7 +405,8 @@ class Bench:
               "Agree only if:", "  - no vehicle control depends on this link, and these two "
               "radios are the whole mesh",
               "  - you are authorized to transmit on every frequency involved", f"  - {wiring}",
-              "  - the doodle service is stopped on both radios", sep="\n")
+              "  - the doodle service is stopped, or its tx_power target is unchanged or the "
+              "power the radio is at now", sep="\n")
         return self.ask("Type yes to continue: ").strip().lower() == "yes"
 
     def reachable(self, node):

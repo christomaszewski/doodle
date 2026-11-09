@@ -22,7 +22,7 @@ hardware checks are listed in the plan.
 | `docker/entrypoints/characterize.py` | Characterization mode (off unless configured): JSON snapshots of this radio and the GCS radio on `/<namespace>/radio/characterization` ([docs/PLAN.md](docs/PLAN.md)) |
 | `docker/compose/compose.deploy.yaml` | One container per radio; the password arrives as a compose secret the launcher writes |
 | `rigging.yaml` | Tells rig how to drive `doodle-up` |
-| `tools/radio_bench.py` | Two-radio bench, run by hand: `check` that everything works from a Mac wired to one radio, plus peer data and channel switching; see [docs/RADIO_BENCH.md](docs/RADIO_BENCH.md) |
+| `tools/radio_bench.py` | Two-radio bench, run by hand: `check` that everything works from a Mac wired to one radio, plus peer data and channel switching; see [docs/RADIO_BENCH.md](docs/RADIO_BENCH.md), and [docs/FIELD_TEST.md](docs/FIELD_TEST.md) for characterization flights |
 
 Every change is live: nothing is written to the radio's flash, so a radio power cycle always
 restores its saved configuration.

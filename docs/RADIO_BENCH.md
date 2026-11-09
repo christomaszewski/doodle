@@ -95,8 +95,10 @@ b over Ethernet and look like an over-the-air switch.
    them. There is no default test frequency, on purpose.
 4. **Make these two radios the whole mesh**, on one firmware, mesh ID, key, channel and bandwidth.
    `chswitch` is mesh-wide, so the tool refuses to move a mesh with a third node.
-5. **Stop the service on both radios** (`./doodle-up <config> down`): it re-applies its power target
-   while the tool is working.
+5. **Keep the service from fighting the tool over power.** Stop it (`./doodle-up <config> down`), or
+   give it a `tx_power` target of `unchanged` or the power the radio is already at; otherwise it
+   re-applies its own target while the tool works. Characterization flights keep it running for
+   its snapshots ([FIELD_TEST.md](FIELD_TEST.md)).
 
 ## Running
 
