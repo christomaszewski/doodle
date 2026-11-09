@@ -1,6 +1,6 @@
 """The installed supervisor with real ROS: /diagnostics arrive, the tx_power parameter changes the
-radio, refuses off, and follows changes made through the control socket. Needs rclpy (CI runs it
-inside the runtime image); skipped elsewhere."""
+radio, refuses off, and follows changes made through the control socket; the supervisor's log
+records reach /rosout. Needs rclpy (CI runs it inside the runtime image); skipped elsewhere."""
 import importlib.util
 import json
 import os
@@ -108,8 +108,13 @@ class RosHealthTests(unittest.TestCase):
 
     def test_diagnostics_and_parameter(self):
         from diagnostic_msgs.msg import DiagnosticArray
-        arrays = []
+        from rcl_interfaces.msg import Log
+        from rclpy.qos import DurabilityPolicy, QoSProfile
+        arrays, logs = [], []
         self.node.create_subscription(DiagnosticArray, "/diagnostics", arrays.append, 10)
+        # Transient local: also the records /rosout kept from before this subscription existed.
+        self.node.create_subscription(Log, "/rosout", logs.append, QoSProfile(
+            depth=1000, durability=DurabilityPolicy.TRANSIENT_LOCAL))
 
         def converged():
             names = {}
@@ -131,6 +136,10 @@ class RosHealthTests(unittest.TestCase):
                           values["health.instance"]), ("medium", "true", "testcar", "mesh"))
         self.assertEqual(rows["mesh: temperature"].message, "unsupported by hardware")
         self.assertEqual(rows["mesh: radio"].hardware_id, "EXAMPLE-SUB smartradio-example")
+        radio = {kv.key: kv.value for kv in rows["mesh: radio"].values}
+        self.assertEqual((radio["rf.country"], radio["rf.distance_m"]), ("US", "1000"))
+        links = {kv.key: kv.value for kv in rows["mesh: links"].values}
+        self.assertEqual(links["links.associated"], "0")
         status = json.loads(self.ctl("status").stdout)
         self.assertEqual(status["diagnostics"], "publishing")
         self.assertEqual(self.ctl("health").returncode, 0)
@@ -146,6 +155,13 @@ class RosHealthTests(unittest.TestCase):
         self.assertFalse(self.set_param(15).successful)  # below the radio's range
         self.assertEqual(self.radio.txpower, 23)
 
+        self.spin_until(lambda: any("request: low" in log.msg for log in logs
+                                    if log.name == "mesh.radio"),
+                        15, "/rosout to carry the request")
+        supervisor = [log.msg for log in logs if log.name == "mesh.radio"]
+        self.assertTrue(any(m.startswith("(before ROS started) doodle: radio http://")
+                            for m in supervisor), supervisor)
+
         self.assertEqual(self.ctl("set", "25").returncode, 0)  # the launcher path
         self.spin_until(lambda: self.get_param() == 25, 15, "the parameter to follow 25 dBm")
 
@@ -154,6 +170,7 @@ class RosHealthTests(unittest.TestCase):
         self.assertEqual(self.radio.txpower, 19)  # shutdown power applied
         log = self.output()
         self.assertIn("publishing /diagnostics", log)
+        self.assertEqual(log.count("request: low"), 1)  # once: no duplicate ROS console line
         self.assertNotIn(self.radio.password, log)
         self.assertNotIn(MESH_KEY, log)
 

@@ -32,7 +32,12 @@ class ClientTests(unittest.TestCase):
         self.assertNotIn("ssid", wireless)
         self.assertEqual(self.api.board()["firmware"], "firmware-2026-03.1")
         self.assertEqual(self.api.power_control(),
-                         {"automatic": True, "aggressive": False, "chanbw": "20"})
+                         {"automatic": True, "aggressive": False, "chanbw": "20",
+                          "settings": {"country": "US", "distance": "1000", "htmode": "HT20",
+                                       "txpower": "30"}})  # allow-listed options only
+        self.assertEqual(self.api.assoclist(), [])
+        self.radio.stations = [{"mac": "00:30:1A:00:00:01", "signal": -60}, "not a station"]
+        self.assertEqual(self.api.assoclist(), [{"mac": "00:30:1A:00:00:01", "signal": -60}])
         self.assertTrue(self.api.rf_up())
         self.assertEqual(self.api.read_json("/tmp/linkstate_current.json")["sta_count"], 0)
 

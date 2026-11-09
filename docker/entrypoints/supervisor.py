@@ -357,11 +357,15 @@ def health_monitor(controller, config, stop_event, health_radio):
     """The ROS diagnostics publisher, unless DOODLE_DIAGNOSTICS=off (tests without ROS)."""
     if os.environ.get("DOODLE_DIAGNOSTICS", "on") == "off":
         return contextlib.nullcontext()
-    from health_ros import ros_health  # rclpy is imported only here
+    from health_ros import ros_health  # rclpy is imported only when ROS starts
     return ros_health(controller, config, stop_event, health_radio)
 
 
 def serve(*, monitor=health_monitor):
+    if os.environ.get("DOODLE_DIAGNOSTICS", "on") != "off":
+        # From the first record on, so /rosout also carries what happened before ROS started.
+        from health_ros import ROSOUT
+        logging.getLogger("doodle").addHandler(ROSOUT)
     stop_event = threading.Event()
     signal.signal(signal.SIGTERM, lambda *_: stop_event.set())
     signal.signal(signal.SIGINT, lambda *_: stop_event.set())

@@ -32,6 +32,10 @@ PERMISSIONS = {
     "rf_toggle": [("ubus", "network.wireless", "up"), ("ubus", "network.wireless", "down")],
 }
 _TRUE = ("1", "true", "yes", "on")
+# wifi-device options reported as radio settings. Only this allow-list leaves power_control(): the
+# device section holds no key, but nothing else from UCI is copied either.
+RADIO_SETTINGS = ("distance", "txpower", "antenna_gain", "txantenna", "rxantenna", "country",
+                  "htmode")
 
 
 class RadioError(RuntimeError):
@@ -255,6 +259,15 @@ class RadioAPI:
                         for key in ("active_time", "busy_time", "rx_time", "tx_time")}
         raise ReplyError(f"iwinfo.survey: no entry for {frequency} MHz")
 
+    def assoclist(self):
+        """The kernel's station table for the interface: one entry per associated peer with its
+        signal, rates, packet/byte counters, retries and failures (rates in kbit/s)."""
+        data = self.call("iwinfo", "assoclist", {"device": self.device})
+        results = data.get("results")
+        if not isinstance(results, list):
+            raise ReplyError("iwinfo.assoclist: malformed reply")
+        return [entry for entry in results if isinstance(entry, dict)]
+
     def rf_up(self):
         # The full reply includes the mesh key; only the up flag leaves this method.
         radio = self.call("network.wireless", "status").get(self.uci_radio)
@@ -265,9 +278,12 @@ class RadioAPI:
     def power_control(self):
         values = self.call("uci", "get", {"config": "wireless", "section": self.uci_radio}) \
                      .get("values") or {}
+        settings = {key: values[key] for key in RADIO_SETTINGS
+                    if isinstance(values.get(key), (str, int, float))
+                    and not isinstance(values.get(key), bool)}
         return {"automatic": str(values.get("dynamic_txpower", "0")).lower() in _TRUE,
                 "aggressive": str(values.get("dynamic_txpower_aggr", "0")).lower() in _TRUE,
-                "chanbw": values.get("chanbw")}
+                "chanbw": values.get("chanbw"), "settings": settings}
 
     def read_text(self, path):
         data = self.call("file", "read", {"path": path}).get("data")

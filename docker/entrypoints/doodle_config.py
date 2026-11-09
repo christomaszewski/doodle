@@ -13,6 +13,8 @@ HOST = re.compile(r"^[A-Za-z0-9.:\[\]-]+$")
 DEVICE = re.compile(r"^[A-Za-z0-9_.-]{1,15}$")
 USERNAME = re.compile(r"^[A-Za-z0-9_.-]+$")
 FINGERPRINT = re.compile(r"^[0-9a-f]{64}$")
+MAC = re.compile(r"^[0-9a-f]{2}(:[0-9a-f]{2}){5}$")
+PEER_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _.-]{0,63}$")
 # A rig `{{var}}` marker that was never filled in (rig itself errors on unknown vars at render
 # time; this catches standalone use of a rig-style config).
 RIG_MARKER = re.compile(r"\{\{\s*([a-z][a-z0-9_]*)\s*\}\}")
@@ -25,7 +27,9 @@ DBM_MIN, DBM_MAX = 0, 40
 UBUS_KEYS = {"host", "port", "scheme", "username", "password", "tls_fingerprint_sha256",
              "device", "uci_radio"}
 TX_POWER_KEYS = {"startup", "shutdown", "levels", "max_dbm"}
-HEALTH_KEYS = {"interval_s", "poll_interval_s", "stale_after_s", "limits"}
+HEALTH_KEYS = {"interval_s", "poll_interval_s", "stale_after_s", "limits", "peers",
+               "reverse_link_peers"}
+MAX_REVERSE_LINK_PEERS = 32
 LIMIT_BOUNDS = ("warn_above", "warn_below", "error_above", "error_below")
 ZENOH_KEYS = {"shared_memory", "shm_pool_mb", "overrides"}
 
@@ -168,7 +172,8 @@ def _number(value, where):
 def health(raw):
     raw = _mapping(raw, "health")
     _no_unknown(raw, HEALTH_KEYS, "health")
-    result = {"interval_s": 1, "poll_interval_s": 5, "stale_after_s": 15, "limits": {}}
+    result = {"interval_s": 1, "poll_interval_s": 5, "stale_after_s": 15, "limits": {},
+              "peers": {}, "reverse_link_peers": 4}
     result.update(raw)
     for key in ("interval_s", "poll_interval_s", "stale_after_s"):
         if _number(result[key], f"health.{key}") <= 0:
@@ -181,6 +186,21 @@ def health(raw):
                 raise ConfigError(f"invalid health.limits.{metric}.{bound}")
             _number(value, f"health.limits.{metric}.{bound}")
     result["limits"] = limits
+    peers = {}
+    for mac, name in _mapping(result["peers"], "health.peers").items():
+        address = str(mac).strip().lower()
+        if not isinstance(mac, str) or not MAC.match(address):
+            raise ConfigError(f"health.peers key {mac!r} must be a MAC address such as "
+                              "\"aa:bb:cc:dd:ee:ff\" (quote it: YAML can read digits and colons "
+                              "as a number)")
+        if not isinstance(name, str) or not PEER_NAME.match(name):
+            raise ConfigError(f"health.peers.{address} must be a name of 1-64 letters, digits, "
+                              "spaces, '_', '.' or '-'")
+        peers[address] = name
+    result["peers"] = peers
+    count = _int(result["reverse_link_peers"], "health.reverse_link_peers")
+    if not 0 <= count <= MAX_REVERSE_LINK_PEERS:
+        raise ConfigError(f"health.reverse_link_peers must be 0..{MAX_REVERSE_LINK_PEERS}")
     return result
 
 
