@@ -42,6 +42,11 @@ What this service relies on, as measured on real hardware. Anything not listed u
 The `user` password is effectively root over the API, and since the June 2025 firmware the
 firewall accepts all incoming connections from the mesh. Fielded radios need a strong password.
 
+`file exec` is narrower than the ACL suggests. On the bench radios (2026-11), `/bin/sh` is refused
+for `user` (ubus status 6, permission denied), although the ACL grants `file` `*` `*`. The probed
+radio (2026-03.1) did run `/usr/sbin/iw` that way, which is how the service sets power;
+`tools/radio_bench.py check` reports whether a given radio will.
+
 ## Calls the service uses
 
 | Purpose | Call | Fields used |

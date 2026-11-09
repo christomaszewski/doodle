@@ -2,11 +2,11 @@
 real ones are what the tool exists to find out. These tests pin its safety behavior instead:
 read-only stages stay read-only, nothing moves past a refusal, and the radios always go home."""
 import argparse
+import base64
 import json
 import os
 from pathlib import Path
 import signal
-import subprocess
 import sys
 import tempfile
 from types import SimpleNamespace
@@ -17,7 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "docker/entrypoints"))
 sys.path.insert(0, str(ROOT / "tests"))
 sys.path.insert(0, str(ROOT / "tools"))
-from fake_radio import FakeRadio, MESH_KEY  # noqa: E402
+from fake_radio import FakeRadio, MESH_KEY, NOT_FOUND, PERMISSION_DENIED  # noqa: E402
 from radio_api import RadioAPI, RadioError  # noqa: E402
 import radio_bench  # noqa: E402
 from radio_bench import (Bench, Log, Node, inventory, passwords, redact, run,  # noqa: E402
@@ -27,6 +27,21 @@ HOME, TEST = 2450, 2480
 TO = {"frequency": TEST, "bandwidth": "10", "count": 5}
 BACK = {"frequency": HOME, "bandwidth": "10", "count": 5}
 WIZARD_KEY = "FIXTURE-WIZARD-KEY"
+STATIONS = "/sys/kernel/debug/ieee80211/phy0/netdev:wlan0/stations/00:30:1a:00:00:0b"
+# A firmware tree for `file list` / `file read`: bytes are files, (type, size) are entries that are
+# never read (a link, and a file over the size limit).
+FIRMWARE_FILES = {
+    "/usr/sbin/acs_multiband": (b'#!/bin/sh\nubus call message-system chswitch "{\\"count\\":3}"\n'
+                                b"wizard -n mesh -k " + WIZARD_KEY.encode()
+                                + b" -c 51 # chswitch\n"),
+    "/usr/sbin/message-system": b"\x7fELF\x01\x00\x00chswitch\x00mode_change\x00bandwidth\x00",
+    "/usr/sbin/ash": ("symlink", 7),
+    "/usr/sbin/huge": ("file", 10_000_000),
+    "/www/index.html": b"<html>nothing to see</html>\n",
+    f"{STATIONS}/peer_signal": b"-61\n",
+    f"{STATIONS}/peer_signal_reply": b"-63 25\n",
+    f"{STATIONS}/fixed_txpower": b"255\n",
+}
 
 
 class BenchRadio(FakeRadio):
@@ -49,7 +64,10 @@ class BenchRadio(FakeRadio):
         self.reached_through = None     # radio b on a one-wire bench: reachable only when linked
         self.misses, self.heard = set(), 0  # which of the peer's switches this radio fails to hear
         self.firmware = "firmware-2026-03.1"
-        self.exec_replies = {}          # command fragment -> its `file exec` reply
+        self.exec_replies = {}          # program -> its `file exec` reply (or an exception)
+        self.refused = {"/bin/sh"}      # what `file exec` refuses, as real radios refuse a shell
+        self.files = dict(FIRMWARE_FILES)
+        self.unreadable_files = set()
 
     def linked(self):
         return (self.peer is not None and self.rf_up and self.peer.rf_up
@@ -102,18 +120,35 @@ class BenchRadio(FakeRadio):
                 return {"values": {"settings": {"enable": "1", "mesh_key": MESH_KEY}}}
             return {"values": {"channel": str(self.saved_frequency - 2399), "chanbw": "10",
                                "dynamic_txpower": "1", "dynamic_txpower_aggr": "0"}}
-        if (obj, method) == ("file", "exec") and args.get("command") == "/bin/sh":
-            command = args["params"][1]
-            if command.startswith("ping"):
-                passes = self.linked() and self.frequency not in self.no_data_on
+        if (obj, method) == ("file", "exec"):
+            command, params = args.get("command"), args.get("params") or []
+            if command in self.refused:
+                return [PERMISSION_DENIED]
+            if command in self.exec_replies:
+                reply = self.exec_replies[command]
+                if isinstance(reply, Exception):
+                    raise reply
+                return reply
+            if command == "/usr/bin/ping":
+                return [NOT_FOUND]  # busybox's ping is /bin/ping here
+            if command == "/bin/ping":
+                passes = params[-1] == "127.0.0.1" or (
+                    self.linked() and self.frequency not in self.no_data_on)
                 return {"code": 0 if passes else 1}
-            for fragment, reply in self.exec_replies.items():
-                if fragment in command:
-                    if isinstance(reply, Exception):
-                        raise reply
-                    return reply
-            return {"code": 0, "stdout": "chswitch count model frequency\n"
-                                         f"wizard -n mesh -k {WIZARD_KEY} -c 51\n"}
+            if command == "/usr/sbin/iw" and params[2:] in (["info"], ["station", "dump"]):
+                return {"code": 0, "stdout": f"Station {self.peer.mac} (on wlan0)\n"
+                        if params[2:] == ["station", "dump"] else "Interface wlan0\n"}
+            if command == "/usr/sbin/batctl":
+                return {"code": 0, "stdout": f"Originator {self.peer.mac}\n"}
+        if (obj, method) == ("file", "list"):
+            return self._list(args.get("path", ""))
+        if (obj, method) == ("file", "read") and args.get("path") in self.files:
+            path = args["path"]
+            if path in self.unreadable_files or not isinstance(self.files[path], bytes):
+                return [PERMISSION_DENIED]
+            data = self.files[path]
+            return {"data": base64.b64encode(data).decode() if args.get("base64")
+                    else data.decode(errors="replace")}
         if (obj, method) == ("system", "reboot"):
             self.frequency, self.channel = self.saved_frequency, self.saved_frequency - 2399
             self.txpower, self.down_polls = 32, 4
@@ -128,6 +163,19 @@ class BenchRadio(FakeRadio):
             self.mesh_stats = ([{"orig_address": self.peer.mac, "tq": 204, "hop_status": "direct",
                                  "last_seen_msecs": 120}] if self.linked() else [])
         return super()._method(obj, method, args)
+
+    def _list(self, directory):
+        prefix, entries = directory.rstrip("/") + "/", {}
+        for path, value in self.files.items():
+            if not path.startswith(prefix):
+                continue
+            name, _, deeper = path[len(prefix):].partition("/")
+            if deeper:
+                entries[name] = {"name": name, "type": "directory", "size": 0}
+            else:
+                kind, size = value if isinstance(value, tuple) else ("file", len(value))
+                entries[name] = {"name": name, "type": kind, "size": size}
+        return {"entries": list(entries.values())} if entries else [NOT_FOUND]
 
     def _drift_home(self):
         if self.comes_home_after is not None:
@@ -173,11 +221,13 @@ class BenchCase(unittest.TestCase):
         return Bench(*nodes, Log(self.directory.name, self.clock), **options)
 
     def changes(self, radio):
-        """Every call that could change the radio (`/bin/sh` runs only ping and read commands)."""
+        """Every call that changes the radio. Programs the bench runs to read (ping, `iw … info`,
+        batctl) are not changes; `iw … set txpower` is."""
         return [call for call in radio.calls
                 if call[:2] in (("message-system", "chswitch"), ("network.wireless", "up"),
                                 ("network.wireless", "down"), ("system", "reboot"))
-                or (call[:2] == ("file", "exec") and call[2]["command"] != "/bin/sh")]
+                or (call[:2] == ("file", "exec")
+                    and (call[2].get("params") or [])[2:4] == ["set", "txpower"])]
 
     def rf_toggles(self, radio):
         return [call for call in radio.calls if call[0] == "network.wireless"
@@ -253,80 +303,84 @@ class InventoryTests(unittest.TestCase):
 class ReadOnlyStageTests(BenchCase):
     def assertUntouched(self):
         for radio in (self.a, self.b):
-            self.assertEqual(radio.writes(), [c for c in radio.calls
-                                              if c[:2] == ("file", "exec")
-                                              and c[2]["command"] == "/bin/sh"])
-            self.assertEqual(self.switches(radio), [])
-            self.assertFalse([c for c in radio.calls if c[:2] == ("system", "reboot")])
+            self.assertEqual(self.changes(radio), [])
 
-    def test_discover_changes_nothing_and_leaks_no_secret(self):
+    def test_discover_finds_callers_without_a_shell_and_leaks_no_secret(self):
         status, report = self.stage("discover")
+        findings = report["findings"]
         self.assertEqual(status, 0)
         self.assertUntouched()
-        self.assertTrue(report["findings"]["callers"]["a"].startswith("found in /usr/sbin"))
-        self.assertNotIn("failed", report["findings"]["callers"]["b"])
-        self.assertEqual(report["findings"]["commands_run"], {"a": True, "b": True})
-        self.assertIn("chswitch", report["radios"]["a"]["vendor/callers /www"]["stdout"])
+        self.assertFalse([c for c in self.a.calls if c[2].get("command") == "/bin/sh"])
+        self.assertTrue(findings["callers"]["a"].startswith(
+            "found in /usr/sbin/acs_multiband, /usr/sbin/message-system"))
+        self.assertIn("2 skipped", findings["callers"]["a"])  # the link and the huge file
+        self.assertEqual(findings["strings_from"]["a"],
+                         ["/usr/sbin/acs_multiband", "/usr/sbin/message-system"])
+        self.assertEqual(findings["exec"]["a"], {"iw (how the service sets TX power)": "allowed",
+                                                 "ping (the bench's data check)": "allowed"})
+        self.assertIn("file", report["radios"]["a"]["acls"])
+        hits = report["radios"]["a"]["search"]["hits"]
+        self.assertTrue(any("ubus call message-system chswitch" in hit for hit in hits))
         written = "".join(path.read_text() for path in Path(self.directory.name).iterdir())
         self.assertNotIn(MESH_KEY, written)
-        self.assertNotIn(WIZARD_KEY, written)
+        self.assertNotIn(WIZARD_KEY, written)  # it is on a matching line: redacted, not dropped
         self.assertNotIn("fixture-password", written)
 
-    def test_every_radio_command_gets_a_path(self):
+    def test_one_firmware_is_searched_on_one_radio(self):
         self.stage("discover")
-        shells = [c for c in self.a.calls if c[:2] == ("file", "exec")]
-        self.assertTrue(shells)
-        for call in shells:
-            self.assertIn("/usr/bin", call[2]["env"]["PATH"])
+        self.assertFalse([c for c in self.b.calls if c[:2] == ("file", "list")])
 
-    def test_discover_says_when_commands_cannot_run(self):
-        for radio in (self.a, self.b):  # what a missing PATH would look like
-            radio.exec_replies = {"": {"code": 0, "stdout": "", "stderr": "sh: grep: not found"}}
-        status, report = self.stage("discover")
-        self.assertEqual(status, 1)
-        self.assertEqual(report["findings"]["commands_run"], {"a": False, "b": False})
-        self.assertTrue(report["findings"]["callers"]["a"].startswith(
-            "failed: /usr/sbin: exit 0: sh: grep: not found"))
-
-    def test_discover_tells_nothing_found_from_a_failure(self):
-        for radio in (self.a, self.b):
-            radio.exec_replies = {"ubus -v list": {"code": 0, "stdout": '"chswitch":{"count"}'},
-                                  "grep -rn": {"code": 0, "stdout": ""}}
-        status, report = self.stage("discover")
-        self.assertEqual(status, 0)
-        self.assertEqual(report["findings"]["callers"], {"a": "none", "b": "none"})
-        self.assertEqual(report["findings"]["signature"], {"a": "found", "b": "found"})
-
-    def test_discover_reports_a_refused_exec(self):
-        self.a.fail["file.exec"] = 6
-        status, report = self.stage("discover")
-        self.assertEqual(status, 1)
-        self.assertIn("permission denied", report["findings"]["callers"]["a"])
+    def test_different_firmware_is_searched_on_both(self):
+        self.b.firmware = "firmware-2025-06.5"
+        _, report = self.stage("discover")
         self.assertTrue(report["findings"]["callers"]["b"].startswith("found"))
 
-    def test_a_slow_place_times_out_alone_and_says_so(self):
-        timeout = RadioError("radio unreachable at fake: TimeoutError: timed out")
-        self.a.exec_replies = {"/www": timeout}
+    def test_nothing_found_says_how_much_was_read(self):
+        for radio in (self.a, self.b):
+            radio.files = {"/usr/sbin/plain": b"#!/bin/sh\necho hello\n"}
         status, report = self.stage("discover")
-        callers = report["findings"]["callers"]["a"]
         self.assertEqual(status, 0)
-        self.assertTrue(callers.startswith("found in /usr/sbin"))
-        self.assertIn("/www: no answer within", callers)
-        self.assertIn("slow command", callers)
+        self.assertEqual(report["findings"]["callers"]["a"], "none in 1 files")
 
-    def test_every_search_limits_itself_on_the_radio(self):
-        self.stage("discover")
-        searches = [c[2]["params"][1] for c in self.a.calls
-                    if c[:2] == ("file", "exec") and "grep -rn" in c[2]["params"][1]]
-        self.assertEqual(len(searches), len(radio_bench.CALLER_PLACES))
-        for command in searches:
-            self.assertIn(f"timeout {radio_bench.COMMAND_LIMIT} grep", command)
-        self.assertLess(radio_bench.COMMAND_LIMIT, radio_bench.EXEC_TIMEOUT)
+    def test_unreadable_files_are_named(self):
+        self.a.unreadable_files = {"/www/index.html"}
+        _, report = self.stage("discover")
+        callers = report["findings"]["callers"]["a"]
+        self.assertTrue(callers.startswith("found"))
+        self.assertIn("1 unreadable, e.g. /www/index.html", callers)
+
+    def test_a_spent_time_budget_is_a_gap_not_a_none(self):
+        with patch.object(radio_bench, "SEARCH_BUDGET", 0.0):
+            status, report = self.stage("discover")
+        self.assertEqual(status, 1)
+        self.assertIn("ran out of time before /usr/sbin", report["findings"]["callers"]["a"])
+
+    def test_a_radio_that_lists_nothing_fails_discover(self):
+        self.a.fail["file.list"] = PERMISSION_DENIED
+        status, report = self.stage("discover")
+        self.assertEqual(status, 1)
+        self.assertTrue(report["findings"]["callers"]["a"].startswith(
+            "failed: no file could be read"))
+
+    def test_a_refused_or_slow_iw_is_reported_plainly(self):
+        self.a.refused = {"/bin/sh", "/usr/sbin/iw"}
+        self.b.exec_replies = {"/usr/sbin/iw": RadioError("radio unreachable at fake: "
+                                                          "TimeoutError: timed out")}
+        _, report = self.stage("discover")
+        exec_ = report["findings"]["exec"]
+        self.assertIn("refused: file.exec: permission denied",
+                      exec_["a"]["iw (how the service sets TX power)"])
+        self.assertIn("failed: no answer within 10 s: probably a slow command",
+                      exec_["b"]["iw (how the service sets TX power)"])
 
     def test_capture_shows_peer_fields_through_the_service_mapping(self):
         status, report = self.stage("capture")
         self.assertEqual(status, 0)
         self.assertUntouched()
+        extras = report["extras"]["a"]
+        self.assertTrue(extras["station_dump"].startswith("Station 00:30:1a:00:00:0b"))
+        self.assertEqual(extras["peer_debugfs"][f"{STATIONS}/peer_signal_reply"], "-63 25")
+        self.assertTrue(extras["batman_originators"].startswith("Originator"))
         link = report["peers"]["link"]["a"]
         self.assertEqual(link["fields"]["rssi_ant"], ["list"])
         self.assertEqual(link["published"]["link.signal_dbm"], {"min": -61, "max": -61})
@@ -381,14 +435,12 @@ class RefusalTests(BenchCase):
         self.assertEqual(self.switches(self.a), [])
 
     def test_no_data_path(self):
-        original = self.a._method
+        self.a.no_data_on = {HOME}
+        self.assertRefused("no data from radio a")
 
-        def no_ping(obj, method, args):
-            if method == "exec":
-                return {"code": 1}
-            return original(obj, method, args)
-        self.a._method = no_ping
-        self.assertRefused("cannot ping")
+    def test_two_wires_and_radios_that_will_not_run_ping_cannot_tell_data(self):
+        self.a.refused |= {"/bin/ping"}
+        self.assertRefused("cannot tell whether data crosses the mesh")
 
     def test_answering_no_moves_nothing(self):
         self.answers = ["no"]
@@ -556,46 +608,6 @@ class WiringTests(unittest.TestCase):
             self.assertFalse(radio_bench.separate_paths(*pair), pair)
 
 
-class RadioShellTests(unittest.TestCase):
-    """The search commands' own text, run by a real /bin/sh (dash on CI, close to the radio's
-    ash) against stub directories and a stub `timeout`. The fake radio never runs them."""
-
-    def setUp(self):
-        directory = tempfile.TemporaryDirectory()
-        self.addCleanup(directory.cleanup)
-        self.root = Path(directory.name)
-        for name, text in (("hit/caller.sh", "ubus call message-system chswitch {}\n"),
-                           ("miss/other.sh", "nothing here\n")):
-            (self.root / name).parent.mkdir()
-            (self.root / name).write_text(text)
-        self.stubs = {"passes": '#!/bin/sh\nshift\nexec "$@"\n', "expires": "#!/bin/sh\nexit 124\n"}
-
-    def search(self, place, timeout=None):
-        bin_dir = self.root / f"bin-{timeout}"
-        bin_dir.mkdir(exist_ok=True)
-        if timeout:
-            stub = bin_dir / "timeout"
-            stub.write_text(self.stubs[timeout])
-            stub.chmod(0o755)
-        command = radio_bench.CALLER_SEARCH.format(limit=radio_bench.COMMAND_LIMIT,
-                                                   places=self.root / place)
-        done = subprocess.run(["/bin/sh", "-c", command], capture_output=True, text=True,
-                              env={"PATH": f"{bin_dir}:/usr/bin:/bin"})
-        return radio_bench.searched({"code": done.returncode, "stdout": done.stdout,
-                                     "stderr": done.stderr})
-
-    def test_found_and_none(self):
-        self.assertEqual(self.search("hit", "passes"), "found")
-        self.assertEqual(self.search("miss", "passes"), "none")
-
-    def test_a_timeout_is_a_failure_even_with_nothing_found(self):
-        self.assertEqual(self.search("miss", "expires"), "failed: exit 124: timed out after 25 s")
-
-    def test_a_missing_timeout_command_is_a_failure_not_none(self):
-        self.assertEqual(self.search("miss"), "failed: exit 127: timeout or grep is missing on "
-                                              "the radio")
-
-
 class OneWireTests(BenchCase):
     """Radio b reached only through radio a's mesh link: nothing may cut b off."""
 
@@ -604,6 +616,14 @@ class OneWireTests(BenchCase):
         self.one_wire()
 
     def test_hop_works_over_one_wire(self):
+        status, report = self.stage("hop")
+        self.assertEqual(status, 0)
+        self.assertEqual(report["findings"]["switches_completed"], "4/4")
+        self.assertHome()
+
+    def test_radios_that_will_not_run_ping_still_hop_over_one_wire(self):
+        for radio in (self.a, self.b):
+            radio.refused |= {"/bin/ping"}
         status, report = self.stage("hop")
         self.assertEqual(status, 0)
         self.assertEqual(report["findings"]["switches_completed"], "4/4")
@@ -782,6 +802,27 @@ class CheckTests(BenchCase):
         self.assertEqual(status, 1)
         self.assertEqual(checks["changes"]["status"], "FAIL")
         self.assertEqual(checks["both radios back where they started"]["status"], "PASS")
+
+    def test_radios_that_will_not_run_ping_still_prove_data_over_one_wire(self):
+        for radio in (self.a, self.b):
+            radio.refused |= {"/bin/ping"}
+        status, checks = self.check(read_only=True)
+        self.assertEqual(status, 0)
+        data = checks["data a -> b across the mesh"]
+        self.assertEqual(data["status"], "PASS")
+        self.assertIn("API answers through the mesh", data["detail"])
+
+    def test_a_radio_that_will_not_run_iw_fails_but_the_channel_test_still_runs(self):
+        self.a.refused |= {"/usr/sbin/iw"}
+        status, checks = self.check(to=TO, home=BACK)
+        self.assertEqual(status, 1)
+        iw = checks["a: the service can run iw (how it sets transmit power)"]
+        self.assertEqual(iw["status"], "FAIL")
+        self.assertIn("permission denied", iw["detail"])
+        self.assertEqual(checks["a: transmit power change"]["status"], "SKIP")
+        self.assertEqual(checks[f"one request to a moves both radios to {TEST} MHz"]["status"],
+                         "PASS")
+        self.assertHome()
 
     def test_to_without_home_is_refused(self):
         status, checks = self.check(to=TO)

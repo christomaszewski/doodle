@@ -16,9 +16,12 @@ Read docs/RADIO_BENCH.md first; this is for two radios on a bench, never a flyin
 `message-system chswitch` is vendor code with undocumented arguments, so they are never guessed:
 `discover` shows how the firmware calls it, and --to/--home pass that JSON through unchanged.
 This tool commits nothing; whether `chswitch` itself writes flash is one of the questions.
+Real radios refuse `file exec` of a shell for the `user` login whatever its ACL says, so nothing
+here needs one: firmware is searched with `file list` and `file read`, and programs run directly.
 Passwords come from DOODLE_BENCH_PASSWORD (and _B if the radios differ) or a prompt, never argv.
 """
 import argparse
+import base64
 import getpass
 import json
 import os
@@ -35,7 +38,7 @@ import time
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "docker" / "entrypoints"))
 import doodle_config  # noqa: E402
 from health import ERROR, OK, STALE, WARN, HealthReporter, link_quality, peer_address  # noqa: E402
-from radio_api import LINKSTATE, RadioAPI, RadioError, ReplyError  # noqa: E402
+from radio_api import IW, LINKSTATE, RadioAPI, RadioError, ReplyError, UbusError  # noqa: E402
 import supervisor  # noqa: E402
 
 POLL = 0.25               # s between looks while a switch settles
@@ -55,35 +58,23 @@ EXPECTED = {"link": ("link.signal_dbm", "link.snr_db", "link.loss_pct"),
 SAVED_WIRELESS = "/etc/config/wireless"  # only ever `file stat`: its contents include the mesh key
 VENDOR_CONFIGS = ("message-system", "central_acs", "acs_multiband", "acs_manual_switch",
                   "link-recovery")
-SHELL_PATH = "/usr/sbin:/usr/bin:/sbin:/bin"  # rpcd may run commands with no PATH at all
 STDERR_CHARS = 400        # of a radio command's error text kept in reports
-COMMAND_LIMIT = 25        # s one radio command may run: under EXEC_TIMEOUT and uhttpd's cut-off
-# One place per command: a slow grep over a whole squashfs once timed out everything at once.
-CALLER_PLACES = ("/usr/sbin", "/etc/init.d", "/usr/share/rpcd /usr/share/luci /usr/share/ucode",
-                 "/usr/lib/lua", "/www", "/usr/bin /sbin /usr/libexec /lib/functions /lib/netifd "
-                 "/lib/wifi /etc/hotplug.d /etc/uci-defaults")
-# grep's own errors (a missing directory) are expected, so its stderr goes nowhere; the exit status
-# still says whether it timed out or could not run at all, so neither reads as "none".
-CALLER_SEARCH = ("out=$(timeout {limit} grep -rn -E 'chswitch|mode_change|channel_idx' {places} "
-                 "2>/dev/null); status=$?; printf '%s\\n' \"$out\" | cut -c1-240 | head -100; "
-                 "case $status in 124|137|143) echo \"timed out after {limit} s\" >&2; exit 124;; "
-                 "126|127) echo \"timeout or grep is missing on the radio\" >&2; exit 127;; esac")
-VENDOR_SHELL = {
-    # It always lists chswitch when commands run at all: an empty answer here means they do not.
-    "signature": "ubus -v list message-system",
-    "strings": "for f in /usr/sbin/message-system /usr/sbin/dl-central-acs /usr/sbin/acs_multiband "
-               "/usr/sbin/acs_manual_switch; do [ -e \"$f\" ] || continue; "
-               "out=$(timeout 5 strings \"$f\" | grep -i -E "
-               "'chswitch|channel|bandwidth|mode_change|model|freq' | head -60); "
-               "[ -n \"$out\" ] && printf '== %s\\n%s\\n' \"$f\" \"$out\"; done; true",
-    **{f"callers {places.split()[0]}": CALLER_SEARCH.format(limit=COMMAND_LIMIT, places=places)
-       for places in CALLER_PLACES}}
-ONE_SHOTS = {
-    "station_dump": 'iw dev "$0" station dump',
-    "peer_debugfs": 'for f in /sys/kernel/debug/ieee80211/*/netdev:"$0"/stations/*/'
-                    'peer_signal* /sys/kernel/debug/ieee80211/*/netdev:"$0"/stations/*/'
-                    'fixed_txpower; do echo "$f: $(cat "$f" 2>&1)"; done',
-    "batman": "batctl n; batctl o"}
+NOT_FOUND, PERMISSION_DENIED = 4, 6  # ubus statuses (docs/RADIO_API.md)
+PING = ("/bin/ping", "/usr/bin/ping")  # run directly: there is no shell to find it
+BATCTL = "/usr/sbin/batctl"
+# The firmware search: directories walked with `file list`, files read with `file read`.
+SEARCH_PLACES = ("/usr/sbin", "/etc/init.d", "/usr/share/rpcd", "/usr/share/luci",
+                 "/usr/share/ucode", "/usr/lib/lua", "/www", "/usr/bin", "/sbin", "/usr/libexec",
+                 "/lib/functions", "/lib/netifd", "/lib/wifi", "/etc/hotplug.d",
+                 "/etc/uci-defaults")
+CALLER_PATTERN = re.compile(rb"chswitch|mode_change|channel_idx")
+STRINGS_OF = ("/usr/sbin/message-system", "/usr/sbin/dl-central-acs", "/usr/sbin/acs_multiband",
+              "/usr/sbin/acs_manual_switch")
+STRINGS_PATTERN = re.compile(rb"chswitch|channel|bandwidth|mode_change|model|freq", re.I)
+PRINTABLE = re.compile(rb"[\x20-\x7e\t]{5,}")  # what `strings` would print from a binary
+MAX_READ_BYTES = 256 * 1024  # larger files (busybox and friends) are skipped, and counted
+MAX_HITS = 200
+SEARCH_BUDGET = 300.0     # s for the whole search on one radio; what it did not reach is listed
 SECRET = re.compile(r"key|pass|pswd|psk|secret|token", re.I)
 SECRET_VALUE = re.compile(r"((?:key|pass\w*|pswd|psk|secret|token)\w*['\"]?\s*[=: ]\s*).*", re.I)
 SECRET_FLAG = re.compile(r"(\s-k\s+)\S+")  # how the Setup Wizard's command line holds the mesh key
@@ -186,6 +177,7 @@ class Node:
 
     def __init__(self, name, api, host):
         self.name, self.api, self.host = name, api, host
+        self.ping_refused = False  # learned once, so polling loops do not keep asking
 
     def observe(self):
         seen = {"rf": None, "frequency": None, "channel": None, "tx_power": None, "peers": None}
@@ -201,13 +193,12 @@ class Node:
             seen["error"] = str(error)
         return seen
 
-    def shell(self, command, *arguments, timeout=EXEC_TIMEOUT):
-        """Arguments arrive as $0, $1…, never inside the command text. The exit status and
-        stderr come back too: an empty stdout alone cannot tell "found nothing" from "never ran"."""
+    def run(self, command, *params, timeout=EXEC_TIMEOUT):
+        """`file exec` of one program, never through a shell. Exit status and stderr come back
+        with stdout, so an empty answer is never mistaken for "found nothing"."""
         try:
-            reply = self.api.call("file", "exec", {"command": "/bin/sh",
-                                                   "params": ["-c", command, *arguments],
-                                                   "env": {"PATH": SHELL_PATH}}, timeout=timeout)
+            reply = self.api.call("file", "exec", {"command": command, "params": list(params)},
+                                  timeout=timeout)
         except RadioError as error:
             if "timed out" not in str(error):
                 raise
@@ -216,13 +207,43 @@ class Node:
         return {"code": reply.get("code"), "stdout": redact(str(reply.get("stdout") or "")),
                 "stderr": redact(str(reply.get("stderr") or ""))[:STDERR_CHARS]}
 
-    def ping(self, host):
-        """Data through the mesh, not just a peer entry. The radios' wired ports are on separate
-        segments on the bench (docs/RADIO_BENCH.md), so this can only cross the air."""
+    def can_run(self, command, *params):
+        """allowed, or why not: a radio can refuse `file exec` whatever its ACL grants."""
         try:
-            return self.shell('ping -c 1 -W 1 "$0"', host, timeout=5)["code"] == 0
-        except RadioError:
-            return False
+            result = self.run(command, *params, timeout=10)
+        except UbusError as error:
+            return f"{'refused' if error.status == PERMISSION_DENIED else 'failed'}: {error}"
+        except RadioError as error:
+            return f"failed: {error}"
+        if result["code"] != 0:
+            return f"failed: exit {result['code']}: {result['stderr'] or 'no error text'}"
+        return "allowed"
+
+    def ping(self, host):
+        """Data through the mesh, not just a peer entry: True or False, or None when this radio
+        will not run ping. On a two-wire bench the radios' wired ports are on separate segments
+        (docs/RADIO_BENCH.md), so a ping between them can only cross the air."""
+        if self.ping_refused:
+            return None
+        for command in PING:
+            try:
+                return self.run(command, "-c", "1", "-W", "1", host, timeout=5)["code"] == 0
+            except UbusError as error:
+                if error.status == NOT_FOUND:
+                    continue
+                if error.status == PERMISSION_DENIED:
+                    break
+                return False
+            except RadioError:
+                return False
+        self.ping_refused = True
+        return None
+
+    def read_bytes(self, path):
+        data = self.api.call("file", "read", {"path": path, "base64": True}).get("data")
+        if not isinstance(data, str):
+            raise ReplyError(f"file.read {path}: malformed reply")
+        return base64.b64decode(data)
 
     def switch(self, arguments):
         self.api.call("message-system", "chswitch", arguments)
@@ -285,6 +306,15 @@ class Bench:
         node.api.set_rf(up)
         return self.until(lambda: self.look(node)["rf"] is up, RF_TIMEOUT)
 
+    def crosses(self):
+        """Does data cross the mesh? -> True, False, or None when it cannot be told. Radio a pings
+        radio b; when radios will not run ping, radio b's API answering is the proof, but only
+        when b is reached through the mesh (one wire)."""
+        result = self.a.ping(self.b.host)
+        if result is None and not self.separate:
+            return self.reachable(self.b)
+        return result
+
     # --- a switch and what follows ---------------------------------------------------------------
 
     def watch(self, frequency):
@@ -302,7 +332,7 @@ class Bench:
                 events.setdefault(f"{node.name}_on_channel", elapsed)
                 if seen["peers"]:
                     events.setdefault(f"{node.name}_peer", elapsed)
-            if settled and self.a.ping(self.b.host):
+            if settled and self.crosses():
                 events["data"] = round(self.clock() - started, 3)
                 return events
             if self.clock() - started >= self.timeout:
@@ -351,8 +381,13 @@ class Bench:
             supported = node.frequencies()
             if supported and target not in supported:
                 problems.append(f"radio {node.name} does not list {target} MHz")
-        if not problems and not self.a.ping(self.b.host):
-            problems.append(f"radio a cannot ping {self.b.host} across the mesh")
+        if not problems:
+            crosses = self.crosses()
+            if crosses is None:
+                problems.append("cannot tell whether data crosses the mesh: radio a will not run "
+                                "ping, and radio b has its own wired path")
+            elif not crosses:
+                problems.append(f"no data from radio a to {self.b.host} across the mesh")
         return power, problems, warnings
 
     def confirm(self, stage, changes):
@@ -456,40 +491,97 @@ def discover(bench, _args):
         for config in VENDOR_CONFIGS:
             read(f"config/{config}",
                  lambda: redact(node.api.call("uci", "get", {"config": config}).get("values")))
-        for name, command in VENDOR_SHELL.items():
-            read(f"vendor/{name}", lambda: node.shell(command))
+        found["acls"] = node.api.acls  # what the login grants; a radio may still refuse more
+        ping = node.ping("127.0.0.1")
+        found["exec"] = {"iw (how the service sets TX power)":
+                         node.can_run(IW, "dev", node.api.device, "info"),
+                         "ping (the bench's data check)":
+                         {True: "allowed", False: "failed", None: "refused or missing"}[ping]}
         radios[node.name] = found
     boards = [found["board"].get("firmware") for found in radios.values()]
-    verdicts = {key: {name: searched(found[f"vendor/{key}"]) for name, found in radios.items()}
-                for key in VENDOR_SHELL}
-    runs = {name: "chswitch" in str((found["vendor/signature"] or {}).get("stdout", ""))
-            for name, found in radios.items()}
-    callers = {name: summarize({key.split(" ", 1)[1]: verdicts[key][name] for key in verdicts
-                                if key.startswith("callers ")}) for name in radios}
-    return {"ok": all(runs.values()), "radios": radios, "findings": {
-        "firmware": boards, "same_firmware": len(set(boards)) == 1, "commands_run": runs,
-        "signature": verdicts["signature"], "strings": verdicts["strings"], "callers": callers}}
+    same = len(set(boards)) == 1
+    results = {}
+    for node in bench.nodes[:1] if same else bench.nodes:  # one firmware: one radio's files do
+        print(f"searching radio {node.name}'s firmware for chswitch callers, at most "
+              f"{SEARCH_BUDGET:g} s...", file=sys.stderr, flush=True)
+        results[node.name] = radios[node.name]["search"] = search(node, bench.clock)
+    return {"ok": all(result["read"] for result in results.values()), "radios": radios,
+            "findings": {
+                "firmware": boards, "same_firmware": same,
+                "exec": {name: found["exec"] for name, found in radios.items()},
+                "callers": {name: verdict(result) for name, result in results.items()},
+                "strings_from": {name: sorted(result["strings"])
+                                 for name, result in results.items()}}}
 
 
-def summarize(verdicts):
-    """One verdict for a search split over several commands, keeping where it came from."""
-    found = [place for place, verdict in verdicts.items() if verdict == "found"]
-    failed = [f"{place}: {verdict[len('failed: '):]}" for place, verdict in verdicts.items()
-              if verdict.startswith("failed")]
-    if found:
-        return "found in " + ", ".join(found) + (f" (also failed: {'; '.join(failed)})"
-                                                  if failed else "")
-    return "failed: " + "; ".join(failed) if failed else "none"
+def search(node, clock, budget=None):
+    """chswitch callers through `file list` and `file read`, which need read access only. Text is
+    matched line by line, a binary by its printable strings (what `strings` would show)."""
+    deadline = clock() + (SEARCH_BUDGET if budget is None else budget)
+    result = {"hits": [], "strings": {}, "read": 0, "skipped": 0, "failed": [],
+              "not_reached": []}
+    queue = list(SEARCH_PLACES)
+    while queue:
+        directory = queue.pop(0)
+        if clock() > deadline:
+            result["not_reached"] = [directory, *queue]
+            break
+        try:
+            entries = node.api.call("file", "list", {"path": directory}).get("entries") or []
+        except UbusError as error:
+            if error.status != NOT_FOUND:  # a directory this firmware lacks is not a gap
+                result["failed"].append(f"{directory}: {error}")
+            continue
+        except RadioError as error:
+            result["failed"].append(f"{directory}: {error}")
+            continue
+        for index, entry in enumerate(entries):
+            if clock() > deadline:
+                result["not_reached"] = [f"{directory} (after {index} entries)", *queue]
+                return result
+            path = f"{directory.rstrip('/')}/{entry.get('name')}"
+            if entry.get("type") == "directory":
+                queue.append(path)
+                continue
+            if entry.get("type") != "file" or (entry.get("size") or 0) > MAX_READ_BYTES:
+                result["skipped"] += 1
+                continue
+            try:
+                data = node.read_bytes(path)
+            except RadioError as error:
+                result["failed"].append(f"{path}: {error}")
+                continue
+            result["read"] += 1
+            texts = PRINTABLE.findall(data) if b"\0" in data else data.splitlines()
+            for number, text in enumerate(texts, 1):
+                if CALLER_PATTERN.search(text) and len(result["hits"]) < MAX_HITS:
+                    line = text.decode(errors="replace").strip()[:240]
+                    result["hits"].append(redact(f"{path}:{number}: {line}"))
+            if path in STRINGS_OF:
+                result["strings"][path] = redact("\n".join(
+                    text.decode(errors="replace") for text in PRINTABLE.findall(data)
+                    if STRINGS_PATTERN.search(text))[:4000])
+    return result
 
 
-def searched(result):
-    """found, none, or why the command failed: an empty answer must never be ambiguous."""
-    if not isinstance(result, dict) or "code" not in result:
-        return f"failed: {(result or {}).get('error', 'no reply')}"
-    output, problem = result["stdout"].strip(), result["stderr"].strip()
-    if result["code"] not in (0, None) or (problem and not output):
-        return f"failed: exit {result['code']}: {problem or 'no error text'}"
-    return "found" if output else "none"
+def verdict(result):
+    """found, none, or what kept the search from being complete: a short answer hides no gap."""
+    files = sorted({hit.split(":", 1)[0] for hit in result["hits"]})
+    if files:
+        head = "found in " + ", ".join(files[:6]) + (" and more" if len(files) > 6 else "")
+    elif result["read"]:
+        head = f"none in {result['read']} files"
+    else:
+        head = "failed: no file could be read"
+    gaps = []
+    if result["not_reached"]:
+        gaps.append("ran out of time before " + ", ".join(result["not_reached"][:3]))
+    if result["failed"]:
+        gaps.append(f"{len(result['failed'])} unreadable, e.g. {result['failed'][0]}")
+    if result["skipped"]:
+        gaps.append(f"{result['skipped']} skipped: links, devices, files over "
+                    f"{MAX_READ_BYTES // 1024} KB")
+    return head + (f" ({'; '.join(gaps)})" if gaps else "")
 
 
 def capture(bench, args):
@@ -517,12 +609,7 @@ def capture(bench, args):
         bench.sleep(SAMPLE)
     for node in bench.nodes:
         extras[node.name]["survey_end"] = survey(node, bench)
-        for name, command in ONE_SHOTS.items():
-            try:
-                result = node.shell(command, node.api.device)
-                extras[node.name][name] = result["stdout"] or searched(result)
-            except RadioError as error:
-                extras[node.name][name] = f"failed: {error}"
+        extras[node.name].update(one_shots(node))
     peers = {kind: {node.name: inventory(entries[kind].get(node.name, []), kind)
                     for node in bench.nodes} for kind in entries}
     heard = all(peers["link"][node.name]["entries"] or peers["mesh"][node.name]["entries"]
@@ -531,6 +618,41 @@ def capture(bench, args):
         "peers_seen_on_both": heard, "too_strong": sorted(too_strong),
         "not_published": {kind: {name: result["not_published"]
                                  for name, result in peers[kind].items()} for kind in peers}}}
+
+
+def one_shots(node):
+    """Per-peer details the link report leaves out, read without a shell."""
+    extras = {}
+
+    def attempt(name, action):
+        try:
+            extras[name] = action()
+        except RadioError as error:
+            extras[name] = f"failed: {error}"
+
+    def command(*argv):
+        result = node.run(*argv)
+        return result["stdout"] or f"exit {result['code']}: {result['stderr'] or 'no output'}"
+
+    attempt("station_dump", lambda: command(IW, "dev", node.api.device, "station", "dump"))
+    attempt("batman_originators", lambda: command(BATCTL, "o"))
+    attempt("peer_debugfs", lambda: peer_debugfs(node))
+    return extras
+
+
+def peer_debugfs(node):
+    """ath9k_tpcd's per-peer files: how each side hears the other, and any power limit on it."""
+    phy = node.api.wireless().get("phy")
+    stations = f"/sys/kernel/debug/ieee80211/{phy}/netdev:{node.api.device}/stations"
+    found = {}
+    for station in node.api.call("file", "list", {"path": stations}).get("entries") or []:
+        for name in ("peer_signal", "peer_signal_reply", "fixed_txpower"):
+            path = f"{stations}/{station.get('name')}/{name}"
+            try:
+                found[path] = node.api.read_text(path).strip()
+            except RadioError as error:
+                found[path] = f"failed: {error}"
+    return found
 
 
 def survey(node, bench):
@@ -593,7 +715,7 @@ def missed(bench, args):
     started = bench.clock()
     while bench.clock() - started < args.watch:
         seen_a, seen_b = bench.look(a), bench.look(b)
-        if seen_a["frequency"] == seen_b["frequency"] and a.ping(b.host):
+        if seen_a["frequency"] == seen_b["frequency"] and bench.crosses():
             rejoined = {"after_s": round(bench.clock() - started, 3),
                         "frequency": seen_a["frequency"]}
             break
@@ -637,10 +759,14 @@ class Checklist:
     """PASS, WARN, FAIL, SKIP and NOTE lines: printed as they happen, kept for report.json."""
 
     def __init__(self):
-        self.items = []
+        self.items, self.blocking = [], []
 
-    def add(self, status, name, detail=""):
+    def add(self, status, name, detail="", *, blocks=True):
+        """A FAIL blocks changes unless `blocks` is false: a finding about one capability (the
+        service cannot run iw) need not stop a test of another (chswitch)."""
         self.items.append({"status": status, "check": name, "detail": detail})
+        if status == "FAIL" and blocks:
+            self.blocking.append(name)
         print(f"{status:<4}  {name}" + (f": {detail}" if detail else ""), flush=True)
 
     def failed(self):
@@ -657,7 +783,7 @@ def check(bench, args):
     items.add("NOTE", "wiring", "each radio has its own wired path" if bench.separate else
               "only radio a is wired here: radio b is reached through the mesh")
     seen = read_checks(bench, items)
-    if args.read_only or items.failed() or len(seen) < 2:
+    if args.read_only or items.blocking or len(seen) < 2:
         why = "--read-only" if args.read_only else "a check above failed"
         items.add("SKIP", "power and channel changes", why)
         return {"ok": not items.failed(), "checks": items.items}
@@ -724,9 +850,21 @@ def read_checks(bench, items):
     for name, report in reports.items():
         link_checks(name, report, items)
     for source, target in ((bench.a, bench.b), (bench.b, bench.a)):
-        items.add("PASS" if source.ping(target.host) else "FAIL",
-                  f"data {source.name} -> {target.name} across the mesh")
+        name = f"data {source.name} -> {target.name} across the mesh"
+        result = source.ping(target.host)
+        if result is None and not bench.separate:
+            items.add("PASS", name, "radio b's API answers through the mesh (these radios will "
+                      "not run ping)")
+        elif result is None:
+            items.add("WARN", name, "cannot tell: the radio will not run ping, and radio b has "
+                      "its own wired path")
+        else:
+            items.add("PASS" if result else "FAIL", name)
     for node in bench.nodes:
+        iw = node.can_run(IW, "dev", node.api.device, "info")
+        items.add("PASS" if iw == "allowed" else "FAIL",
+                  f"{node.name}: the service can run iw (how it sets transmit power)",
+                  "" if iw == "allowed" else iw, blocks=False)
         service_checks(bench, node, seen[node.name], items)
     return seen
 
@@ -804,6 +942,10 @@ def power_round_trip(bench, items):
     """The supervisor's write path on radio a, which is always wired: one supported step down
     (or up), read back, the link checked, then back. The same calls as `doodle-up … tx-power`."""
     a = bench.a
+    iw = a.can_run(IW, "dev", a.api.device, "info")
+    if iw != "allowed":
+        items.add("SKIP", "a: transmit power change", f"radio a will not run iw: {iw}")
+        return
     with tempfile.TemporaryDirectory() as directory:
         controller = bench.controller(a, directory)
         before = controller.status()["tx_power_dbm"]
@@ -817,10 +959,14 @@ def power_round_trip(bench, items):
         applied = changed["converged"] and changed["tx_power_dbm"] == step
         items.add("PASS" if applied else "FAIL", "a: transmit power change",
                   f"{before} -> {changed['tx_power_dbm']} dBm, read back")
-        crossed = bench.until(lambda: a.ping(bench.b.host), 10)
-        items.add("PASS" if crossed is not None else "WARN", f"link at {step} dBm",
-                  f"data after {crossed} s" if crossed is not None else
-                  "no data for 10 s: a live power change may interrupt the link")
+        crossed = bench.until(lambda: bench.crosses() is not False, 10)
+        if bench.crosses() is None:
+            items.add("WARN", f"link at {step} dBm", "cannot tell: radio a will not run ping, and "
+                      "radio b has its own wired path")
+        else:
+            items.add("PASS" if crossed is not None else "WARN", f"link at {step} dBm",
+                      f"data after {crossed} s" if crossed is not None else
+                      "no data for 10 s: a live power change may interrupt the link")
         back = controller.request(before)
         items.add("PASS" if back["tx_power_dbm"] == before else "FAIL",
                   "a: transmit power restored", f"{back['tx_power_dbm']} dBm")

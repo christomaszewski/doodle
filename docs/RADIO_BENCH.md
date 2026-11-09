@@ -8,7 +8,7 @@ vehicle that can fly.
 | Question | Stage | Changes the radios | Read in `report.json` |
 |---|---|---|---|
 | Is everything working? | `check` | Only after the read-only checks pass and you agree | `checks` (also printed as it runs) |
-| How does the firmware call `chswitch`? | `discover` | No | `findings.callers` (`found`, `none` or why it failed), then `radios.a["vendor/callers"]`, `["vendor/strings"]`, `["config/…"]` |
+| How does the firmware call `chswitch`? | `discover` | No | `findings.callers` (`found in …`, `none in N files`, or what kept the search from finishing), then `radios.a.search.hits`, `.strings` and `["config/…"]`; `findings.exec` says whether each radio will run `iw` and ping |
 | What do peer entries hold, and does the service's mapping survive them? | `capture` | No | `peers`, `findings.not_published` |
 | How long does a switch take? Does it touch saved config or TX power? | `hop` | Yes | `findings.timing`, `findings.saved_config_rewritten`, `findings.tx_power_changed` |
 | What if one radio misses the switch? | `missed` | Yes | `findings.rejoined_by_itself`, `findings.b_landed_on` |
@@ -28,8 +28,15 @@ python3 tools/radio_bench.py --a <radio-a> --b <radio-b> check --read-only
 
 It checks, for both radios: API login and the permissions the service needs; firmware 2025-06 or
 later, and the same on both; RF on and the same channel and bandwidth; exactly one peer, with a
-signal that is neither too strong nor weak; data in both directions across the mesh; and the
-service's own code against each radio. That means the supervisor's read path and every diagnostic
+signal that is neither too strong nor weak; data in both directions across the mesh; whether the
+radio will run `iw`, which is how the service sets transmit power; and the service's own code
+against each radio.
+
+Real radios refuse `file exec` of a shell for the `user` login, whatever its ACL says, so the
+tool never uses one. Programs run directly. Data across the mesh is checked with ping where a
+radio will run it; on one wire, radio b's API answering through the mesh is the proof instead.
+`discover` searches the firmware through the API's file list and file read, which needs read
+access only and can take a few minutes. That means the supervisor's read path and every diagnostic
 component the service would publish, including the values the dashboard relies on. Those are the
 outstanding hardware checks in [PLAN.md](PLAN.md).
 
