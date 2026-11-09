@@ -16,6 +16,10 @@ What this service relies on, as measured on real hardware. Anything not listed u
   returns the JSON-RPC error `{"code":-32002,"message":"Access denied"}` → log in again.
 - Every call: `{"method":"call","params":[<session>,<object>,<method>,<args>]}`. The reply is
   `"result":[<ubus status>]` or `"result":[0,<data>]`.
+- Keep-alive: uhttpd closes idle connections (OpenWrt's default is after 20 s). On the bench
+  radios, the first request on such a connection after an operator prompt came back as a bad
+  status line (`0`) instead of a clean disconnect. The client reconnects once for either, but
+  retries a bad status line only on a reused connection.
 
 | ubus status | Meaning |
 |---|---|

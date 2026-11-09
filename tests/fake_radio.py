@@ -199,6 +199,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if self.server.radio.unreachable:  # drop the connection without answering
             self.close_connection = True
             return
+        if self.server.garbage_replies:  # what a real radio's idle keep-alive connection sent
+            self.server.garbage_replies -= 1
+            self.wfile.write(b"0\r\n\r\n")
+            self.close_connection = True
+            return
         self.server.connections.add(id(self.connection))
         data = json.dumps(self.server.radio.handle(json.loads(body))).encode()
         self.send_response(200)
@@ -222,6 +227,7 @@ class Server(http.server.ThreadingHTTPServer):
         self.radio = radio
         self.connections = set()
         self.close_after_reply = False
+        self.garbage_replies = 0  # next requests answered with a bare "0" instead of HTTP
 
     def handle_error(self, request, client_address):
         pass  # clients that hang up mid-handshake (TLS pin tests) are expected

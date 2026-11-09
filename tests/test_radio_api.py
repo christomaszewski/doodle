@@ -112,6 +112,29 @@ class TransportTests(unittest.TestCase):
             client.system_info()  # the radio closed the connection: reconnect transparently
             client.close()
 
+    def test_a_stale_connection_answering_garbage_reconnects_once(self):
+        # Seen on real radios after an operator prompt: the reused connection answers "0".
+        radio = FakeRadio()
+        with Server(radio) as server:
+            client = RadioAPI("127.0.0.1", "user", "fixture-password", scheme="http",
+                              port=server.server_address[1])
+            client.system_info()
+            server.garbage_replies = 1
+            self.assertIn("uptime", client.system_info())
+            self.assertEqual(len(server.connections), 2)
+            client.close()
+
+    def test_garbage_on_a_new_connection_is_an_error_not_a_retry(self):
+        radio = FakeRadio()
+        with Server(radio) as server:
+            client = RadioAPI("127.0.0.1", "user", "fixture-password", scheme="http",
+                              port=server.server_address[1])
+            server.garbage_replies = 5
+            with self.assertRaisesRegex(RadioError, "unreachable .*BadStatusLine"):
+                client.system_info()
+            self.assertEqual(server.garbage_replies, 4)  # asked once, not twice
+            client.close()
+
     def test_unreachable_radio_is_a_bounded_error(self):
         client = RadioAPI("127.0.0.1", "user", "pw", scheme="http", port=1, timeout=1)
         with self.assertRaisesRegex(RadioError, "unreachable"):
