@@ -43,8 +43,10 @@ the Setup Wizard. Do not restore a backup taken on older firmware.
 - The service needs only the `user` password. In the config, set
   `connection.ubus.password: "{{doodle_radio_password}}"` and provision the value once per vehicle
   with `sudo rig provision --var doodle_radio_password='<password>'` (stored in
-  `/etc/rig/vehicle.local.yaml`; `rig bake` never reads it). Standalone, put the password itself
-  in a config kept out of git. The launcher writes it to `var/run/<name>.radio_password` (0600)
+  `/etc/rig/vehicle.local.yaml`; `rig bake` never reads it). Writing that file by hand, put the
+  password in single quotes (`doodle_radio_password: '…'`, a `'` inside doubled as `''`): YAML
+  reads a leading `!` as a tag, `&` and `*` as anchors, and digits as a number. Standalone, put the
+  password itself in a config kept out of git. The launcher writes it to `var/run/<name>.radio_password` (0600)
   for the container's compose secret; it never appears in the rendered compose or the container
   environment, and `down` deletes it.
 - At the time of writing, rig writes `/etc/rig/vehicle.local.yaml` and the filled-in config
