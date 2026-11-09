@@ -120,6 +120,31 @@ class ConfigTests(unittest.TestCase):
                 dc.load({**base(), **bad})
 
 
+    def test_characterization_block(self):
+        self.assertEqual(dc.load(base())["characterization"],
+                         {"enabled": False, "poll_interval_s": 1, "gcs": None})
+        plain = json.loads(dc.runtime_json(dc.load(base())))
+        self.assertNotIn("characterization", plain)  # existing configs render as they did
+        self.assertFalse(dc.runtime(plain)["characterization"]["enabled"])
+        config = dc.load({**base(), "characterization": {"enabled": True,
+                                                         "gcs": {"host": "10.223.18.60"}}})
+        gcs = config["characterization"]["gcs"]
+        self.assertEqual((gcs["host"], gcs["scheme"], gcs["username"]),
+                         ("10.223.18.60", "https", "user"))
+        rendered = dc.runtime_json(config)
+        self.assertNotIn("Config-Test-Pw", rendered)
+        self.assertEqual(dc.runtime(json.loads(rendered))["characterization"],
+                         config["characterization"])
+        for bad in ({"enabled": "yes"}, {"poll_interval_s": 0}, {"surprise": 1}):
+            with self.assertRaises(ConfigError, msg=bad):
+                dc.load({**base(), "characterization": bad})
+        with self.assertRaisesRegex(ConfigError, "takes no password.*connection.ubus.password"):
+            dc.load({**base(), "characterization": {"gcs": {"host": "10.223.18.60",
+                                                            "password": "p"}}})
+        with self.assertRaisesRegex(ConfigError, "characterization.gcs.host"):
+            dc.load({**base(), "characterization": {"gcs": {}}})
+
+
 class PowerTests(unittest.TestCase):
     RANGE = list(range(19, 33))
 

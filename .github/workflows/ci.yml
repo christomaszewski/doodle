@@ -56,7 +56,7 @@ jobs:
             -e DOODLE_TEST_ENTRYPOINT_DIR=/usr/local/bin \
             -v "$PWD:/workspace:ro" -w /workspace/tests doodle_radio:ci \
             python3 -m unittest test_radio_api test_supervisor test_service test_health \
-              test_health_ros -v
+              test_characterize test_health_ros -v
 
   # ---------------------------------------------------------------------------
   # rig launcher contract, executable (see rigging.yaml): `rig certify` renders

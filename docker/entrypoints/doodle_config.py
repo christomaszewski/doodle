@@ -26,6 +26,7 @@ UBUS_KEYS = {"host", "port", "scheme", "username", "password", "tls_fingerprint_
              "device", "uci_radio"}
 TX_POWER_KEYS = {"startup", "shutdown", "levels", "max_dbm"}
 HEALTH_KEYS = {"interval_s", "poll_interval_s", "stale_after_s", "limits"}
+CHARACTERIZATION_KEYS = {"enabled", "poll_interval_s", "gcs"}
 LIMIT_BOUNDS = ("warn_above", "warn_below", "error_above", "error_below")
 ZENOH_KEYS = {"shared_memory", "shm_pool_mb", "overrides"}
 
@@ -184,6 +185,32 @@ def health(raw):
     return result
 
 
+def characterization(raw):
+    """Off unless enabled: a faster read-only poll of this radio and, if `gcs` names it, the GCS
+    radio over the mesh, published for recording (docker/entrypoints/characterize.py). The GCS
+    radio is reached with this radio's password, so `gcs` takes none."""
+    raw = _mapping(raw, "characterization")
+    _no_unknown(raw, CHARACTERIZATION_KEYS, "characterization")
+    enabled = raw.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise ConfigError("characterization.enabled must be true or false")
+    interval = _number(raw.get("poll_interval_s", 1), "characterization.poll_interval_s")
+    if interval <= 0:
+        raise ConfigError("characterization.poll_interval_s must be positive")
+    gcs = None
+    if raw.get("gcs") is not None:
+        block = _mapping(raw["gcs"], "characterization.gcs")
+        if "password" in block:
+            raise ConfigError("characterization.gcs takes no password: the GCS radio is reached "
+                              "with connection.ubus.password")
+        try:
+            gcs = connection({"type": "ubus", "ubus": block}, runtime=True)
+        except ConfigError as error:
+            raise ConfigError(str(error).replace("connection.ubus", "characterization.gcs")) \
+                from None
+    return {"enabled": enabled, "poll_interval_s": interval, "gcs": gcs}
+
+
 def zenoh(raw):
     """The fleet-uniform `zenoh:` block -> (ZENOH_CONFIG_OVERRIDE pairs, warnings).
 
@@ -244,6 +271,7 @@ def load(cfg):
         "connection": connection(cfg.get("connection")),
         "tx_power": tx_power(cfg.get("tx_power")),
         "health": health(cfg.get("health")),
+        "characterization": characterization(cfg.get("characterization")),
         "zenoh_override": zenoh_pairs,
         "warnings": warnings,
     }
@@ -252,18 +280,22 @@ def load(cfg):
 def runtime(raw):
     """The subset the container receives as DOODLE_CONFIG, validated again on arrival."""
     raw = _mapping(raw, "DOODLE_CONFIG")
-    _no_unknown(raw, {"connection", "tx_power", "health"}, "DOODLE_CONFIG")
+    _no_unknown(raw, {"connection", "tx_power", "health", "characterization"}, "DOODLE_CONFIG")
     return {"connection": connection({"type": "ubus", "ubus": raw.get("connection")}, runtime=True),
             "tx_power": tx_power(raw.get("tx_power")),
-            "health": health(raw.get("health"))}
+            "health": health(raw.get("health")),
+            "characterization": characterization(raw.get("characterization"))}
 
 
 def runtime_json(config):
-    """Deterministic DOODLE_CONFIG for a validated config. Never contains the password."""
+    """Deterministic DOODLE_CONFIG for a validated config. Never contains the password.
+    Characterization appears only when enabled, so other configs render as they always have."""
     conn = {k: v for k, v in config["connection"].items() if k != "password"}
-    return json.dumps({"connection": conn, "tx_power": config["tx_power"],
-                       "health": config["health"]}, sort_keys=True, separators=(",", ":"),
-                      allow_nan=False)
+    runtime_config = {"connection": conn, "tx_power": config["tx_power"],
+                      "health": config["health"]}
+    if config.get("characterization", {}).get("enabled"):
+        runtime_config["characterization"] = config["characterization"]
+    return json.dumps(runtime_config, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
 
 def unresolved_password_var(config):

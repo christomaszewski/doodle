@@ -99,6 +99,24 @@ radio's fields as they are; thresholds on them can be added once a second radio 
 names. The key list is in SERVICE_HEALTH.md (Revision 2, to be copied to the dashboard,
 camera-service and ouster repos).
 
+## Characterization mode
+
+For characterization flights, `characterization.enabled: true` adds a read-only poll, every
+`characterization.poll_interval_s` (1 s by default), of this radio and, when `characterization.gcs`
+names it, of the GCS radio over the mesh. Each poll is one JSON snapshot on
+`/<ns>/radio/characterization` (`std_msgs/String`), recorded with everything else; `/diagnostics`
+does not change, so the dashboard's health view and radio indicator are unaffected.
+
+A snapshot carries `schema`, `instance`, `vehicle_id`, `sequence`, `stamp_unix_ns`, `poll_s` and,
+per radio (`vehicle`, `gcs`): RF state, `iwinfo info` (frequency, channel, TX power, noise), the
+link report without its wrong radio clock (its own `oper_freq` labels samples right after a channel
+switch), the operating channel's airtime counters, `iw station dump`, and ath9k_tpcd's per-peer
+files (`peer_signal_reply` is how the peer hears this radio). A failed read is recorded in place as
+`{"error": …}`; a radio that cannot be reached is `{"unreachable": …}`, at one request per poll.
+
+The GCS radio is reached with this radio's API password, over its own sessions with 2 s timeouts.
+Nothing in this mode writes to either radio: channel changes come from `tools/radio_bench.py`.
+
 ## Phases
 
 1. **Rig skeleton** — `rigging.yaml`, `doodle-up`, `tools/render_config.py`, compose, runtime

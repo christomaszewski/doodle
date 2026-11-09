@@ -31,9 +31,10 @@ build:
   architectures: [arm64, amd64]
   capabilities: {no_cache: true, platforms: true}
 
-# No `msgs:` block: the service uses only diagnostic_msgs and rcl_interfaces (the tx_power
-# parameter), which ros-core and the fleet-ros base already carry. No host ports (it is an HTTPS
-# client of the radio) and no external volumes (runtime requests live in the container).
+# No `msgs:` block: the service uses only diagnostic_msgs, std_msgs (characterization snapshots)
+# and rcl_interfaces (the tx_power parameter), which ros-core and the fleet-ros base already carry.
+# No host ports (it is an HTTPS client of the radio) and no external volumes (runtime requests live
+# in the container).
 
 # Files rig vendors onto the vehicle to run this service. The runtime is the published image, so
 # no build context belongs here. render_config.py imports doodle_config.py (one validator for

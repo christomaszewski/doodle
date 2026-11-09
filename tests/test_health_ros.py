@@ -40,12 +40,20 @@ class RosHealthTests(unittest.TestCase):
         self.addCleanup(lambda: self.server.__exit__(None, None, None))
         tmp = Path(self.tmp.name)
         (tmp / "radio_password").write_text(self.radio.password)
+        extra = {}
+        if self._testMethodName == "test_characterization_snapshots":
+            self.gcs = FakeRadio()  # same password: the GCS radio is reached with this radio's
+            self.gcs_server = Server(self.gcs).__enter__()
+            self.addCleanup(lambda: self.gcs_server.__exit__(None, None, None))
+            extra["characterization"] = {"enabled": True, "poll_interval_s": 0.5, "gcs": {
+                "host": "127.0.0.1", "scheme": "http",
+                "port": self.gcs_server.server_address[1]}}
         config = doodle_config.load({
             "name": "mesh", "tx_power": {"startup": "medium", "shutdown": "standby"},
             "health": {"interval_s": 0.5, "poll_interval_s": 1},
             "connection": {"ubus": {"host": "127.0.0.1", "scheme": "http",
                                     "port": self.server.server_address[1],
-                                    "password": self.radio.password}}})
+                                    "password": self.radio.password}}, **extra})
         self.env = dict(os.environ, DOODLE_CONFIG=doodle_config.runtime_json(config),
                         DOODLE_NAME="mesh", DOODLE_NAMESPACE="/mesh", VEHICLE_ID="testcar",
                         DOODLE_SECRET_FILE=str(tmp / "radio_password"),
@@ -105,6 +113,24 @@ class RosHealthTests(unittest.TestCase):
         client = self.node.create_client(GetParameters, "/mesh/radio/get_parameters")
         request = GetParameters.Request(names=["tx_power"])
         return parameter_value_to_python(self.call(client, request).values[0])
+
+    def test_characterization_snapshots(self):
+        from std_msgs.msg import String
+        snapshots = []
+        self.node.create_subscription(String, "/mesh/radio/characterization", snapshots.append, 10)
+        self.spin_until(lambda: len(snapshots) >= 2, 60, "two characterization snapshots")
+        first, second = (json.loads(message.data) for message in snapshots[:2])
+        self.assertEqual(second["sequence"], first["sequence"] + 1)
+        self.assertEqual((first["instance"], first["vehicle_id"]), ("mesh", "testcar"))
+        self.assertEqual(set(first["radios"]), {"vehicle", "gcs"})
+        for view in first["radios"].values():
+            self.assertEqual(view["wireless"]["frequency"], 2450)
+            self.assertEqual(view["linkstate"]["oper_freq"], 2450)
+        self.assertNotIn(MESH_KEY, snapshots[0].data)
+        writes = [c for c in self.gcs.calls if c[:2] in (("network.wireless", "up"),
+                                                         ("network.wireless", "down"))
+                  or c[:2] == ("file", "exec") and (c[2].get("params") or [])[2:3] == ["set"]]
+        self.assertEqual(writes, [])  # the GCS radio is only ever read
 
     def test_diagnostics_and_parameter(self):
         from diagnostic_msgs.msg import DiagnosticArray

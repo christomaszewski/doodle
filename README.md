@@ -19,6 +19,7 @@ hardware checks are listed in the plan.
 | `docker/entrypoints/radio_api.py` | The radio's ubus JSON-RPC API over HTTPS; see [docs/RADIO_API.md](docs/RADIO_API.md) |
 | `docker/entrypoints/health.py` | Read-only radio, link and system observations as diagnostics ([docs/SERVICE_HEALTH.md](docs/SERVICE_HEALTH.md)) |
 | `docker/entrypoints/health_ros.py` | The ROS node `/<namespace>/radio`: `/diagnostics` and the `tx_power` parameter |
+| `docker/entrypoints/characterize.py` | Characterization mode (off unless configured): JSON snapshots of this radio and the GCS radio on `/<namespace>/radio/characterization` ([docs/PLAN.md](docs/PLAN.md)) |
 | `docker/compose/compose.deploy.yaml` | One container per radio; the password arrives as a compose secret the launcher writes |
 | `rigging.yaml` | Tells rig how to drive `doodle-up` |
 | `tools/radio_bench.py` | Two-radio bench, run by hand: `check` that everything works from a Mac wired to one radio, plus peer data and channel switching; see [docs/RADIO_BENCH.md](docs/RADIO_BENCH.md) |
