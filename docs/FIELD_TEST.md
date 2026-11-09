@@ -159,20 +159,26 @@ Then confirm both radios, on the ground:
 python3 tools/radio_bench.py --a $GCS --b $VEHICLE check --read-only
 ```
 
-**In flight**, fly the two home-channel corkscrews without the tool. For each test channel, while
-holding at 10 m, run this and type `yes`. Start the corkscrew when it prints
-`switch to <MHz> … both radios there`; after the dwell it switches both radios home by itself and
-prints the result. Hold until it has, then start the next channel's command. `--dwell` is the
-corkscrew's 150 s plus about 15 s, so the switch home happens during the hold, not the last turn.
+**In flight**, fly the first home-channel corkscrew without the tool. Then, at each 10 m hold,
+switch both radios to the next channel and leave them there, so each corkscrew takes as long as
+it takes. Type `yes` at the prompt (or add `--yes` once you trust it) and start the corkscrew when
+it prints `both radios stay on <MHz>`:
 
 ```bash
-python3 tools/radio_bench.py --a $GCS --b $VEHICLE hop --to "$(sw <channel-mhz>)" --home "$(sw $HOME_MHZ)" --repeats 1 --dwell 165
+python3 tools/radio_bench.py --a $GCS --b $VEHICLE switch --to "$(sw <channel-mhz>)" --home "$(sw $HOME_MHZ)"
 ```
 
+After the last test channel, switch home the same way and fly the last home corkscrew:
+
+```bash
+python3 tools/radio_bench.py --a $GCS --b $VEHICLE switch --to "$(sw $HOME_MHZ)" --home "$(sw $HOME_MHZ)"
+```
+
+If a switch does not complete, it brings both radios back home by itself; carry on from there.
 Allow 20–30 s per hold until 3.3 has shown the real switch times. Have the bag logger running on
 the vehicle before takeoff.
 
-**After landing:**
+**After landing**, if the radios are not home yet, switch them home (above), then:
 
 ```bash
 python3 tools/radio_bench.py --a $GCS --b $VEHICLE check --read-only

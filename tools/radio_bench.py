@@ -283,6 +283,7 @@ class Bench:
         self.log, self.to, self.home, self.timeout = log, to, home, timeout
         self.separate, self.wired = separate, (a, b) if separate else (a,)
         self.ask, self.clock, self.sleep = ask, clock, sleep
+        self.came_from = None  # a `switch` leaves from here: where a missed radio b may still be
 
     def look(self, node):
         seen = node.observe()
@@ -357,12 +358,13 @@ class Bench:
 
     # --- safety ----------------------------------------------------------------------------------
 
-    def preflight(self):
-        """-> (starting power by radio, problems, warnings). Only these two radios, together, at
-        home, pass: anything else is a problem and nothing moves."""
-        problems, warnings, power = [], [], {}
+    def preflight(self, stay=False):
+        """-> (starting power by radio, problems, warnings). Only these two radios, hearing each
+        other with data crossing, pass: together at home, or for a `switch` (stay) together on
+        any one channel but the target. Anything else is a problem and nothing moves."""
+        problems, warnings, power, frequencies = [], [], {}, {}
         home, target = self.home["frequency"], self.to["frequency"]
-        if home == target:
+        if home == target and not stay:
             problems.append("--to and --home are the same frequency")
         for node in self.nodes:
             seen = self.look(node)
@@ -370,7 +372,8 @@ class Bench:
             if seen["rf"] is not True or "error" in seen:
                 problems.append(f"radio {node.name} is not up: {seen.get('error', 'RF off')}")
                 continue
-            if seen["frequency"] != home:
+            frequencies[node.name] = seen["frequency"]
+            if not stay and seen["frequency"] != home:
                 problems.append(f"radio {node.name} is on {seen['frequency']} MHz, not home {home}")
             report = node.report()
             peers = peer_count(report)
@@ -387,6 +390,14 @@ class Bench:
             supported = node.frequencies()
             if supported and target not in supported:
                 problems.append(f"radio {node.name} does not list {target} MHz")
+        if stay and len(frequencies) == 2:
+            if len(set(frequencies.values())) > 1:
+                problems.append("the radios are on different channels: " + ", ".join(
+                    f"{name} {frequency} MHz" for name, frequency in frequencies.items()))
+            elif target in frequencies.values():
+                problems.append(f"both radios are already on {target} MHz")
+            else:
+                self.came_from = frequencies["a"]
         if not problems:
             crosses = self.crosses()
             if crosses is None:
@@ -420,10 +431,11 @@ class Bench:
                                      Path(directory) / "target.json", clock=self.clock,
                                      stop_event=stop, sleep=self.sleep)
 
-    def restore(self, power):
+    def restore(self, power, channel=True):
         """Both radios home at their starting power, by the least invasive way that works. RF is
         toggled only on a radio with a wired path of its own: through the mesh it would strand it.
-        With no --home (a `check` without a channel switch) only the power is put back."""
+        With no --home (a `check` without a channel switch), or after a `switch` that completed
+        (channel false), only the power is put back."""
         steps = []
 
         def attempt(what, action):
@@ -433,7 +445,7 @@ class Bench:
             except RadioError as error:
                 steps.append(f"{what} failed: {error}")
 
-        if self.home is not None:
+        if channel and self.home is not None:
             home = self.home["frequency"]
             for node in self.wired:
                 if self.look(node)["rf"] is False:
@@ -457,24 +469,30 @@ class Bench:
             if isinstance(wanted, int) and self.look(node)["tx_power"] != wanted:
                 attempt(f"{node.name}: tx power {wanted}", lambda: node.api.set_txpower(wanted))
         state = {node.name: self.look(node) for node in self.nodes}
-        at_home = self.home is None or all(seen["frequency"] == self.home["frequency"]
-                                           for seen in state.values())
+        at_home = not channel or self.home is None or all(
+            seen["frequency"] == self.home["frequency"] for seen in state.values())
         return {"ok": at_home and all(seen["tx_power"] == power.get(name)
                                       for name, seen in state.items()),
                 "at_home": at_home, "steps": steps, "state": state}
 
     def rendezvous(self, attempt):
-        """Radio b is reached only through the mesh, and the mesh is split: radio a goes to the
-        channel b was sent to, then brings both home from there."""
+        """Radio b is reached only through the mesh, and the mesh is split: radio a goes to each
+        channel b could be on (where it was sent, then where a `switch` left from), and brings
+        both home from the one where it finds b."""
         if self.to is None:
             return
         home = self.home["frequency"]
-        attempt(f"a: chswitch {self.to['frequency']} to find b", lambda: self.a.switch(self.to))
-        found = self.until(lambda: self.reachable(self.b), self.timeout) is not None
-        attempt("a: chswitch home" + ("" if found else " without b"),
-                lambda: self.a.switch(self.home))
-        self.until(lambda: self.on(self.a, home) and (not found or self.on(self.b, home)),
-                   SETTLE)
+        candidates = [self.to]
+        if self.came_from not in (None, home, self.to["frequency"]):
+            candidates.append(dict(self.to, frequency=self.came_from))  # same model and width
+        for target in candidates:
+            attempt(f"a: chswitch {target['frequency']} to find b", lambda: self.a.switch(target))
+            if self.until(lambda: self.reachable(self.b), self.timeout) is not None:
+                attempt("a: chswitch home", lambda: self.a.switch(self.home))
+                self.until(lambda: self.on(self.a, home) and self.on(self.b, home), SETTLE)
+                return
+        attempt("a: chswitch home without b", lambda: self.a.switch(self.home))
+        self.until(lambda: self.on(self.a, home), SETTLE)
 
 
 # --- stages --------------------------------------------------------------------------------------
@@ -671,6 +689,16 @@ def survey(node, bench):
     except RadioError as error:
         return {"error": str(error)}
     return next((r for r in results or [] if r.get("mhz") == frequency), None)
+
+
+def switch(bench, _args):
+    """One mesh-wide switch that stays, for flights where each leg takes as long as it takes.
+    Both radios end on --to; a switch that does not complete brings both back to --home."""
+    events = bench.move(bench.a, bench.to)
+    done = "data" in events
+    return {"ok": done, "stay": done, "events": events, "findings": {
+        "now_on": bench.to["frequency"] if done else None, "came_from": bench.came_from,
+        "events": events}}
 
 
 def hop(bench, args):
@@ -996,9 +1024,9 @@ def channel_round_trip(bench, items):
         items.add("PASS", name, f"data after {events['data']} s")
 
 
-STAGES = {"check": check, "discover": discover, "capture": capture, "hop": hop,
-          "missed": missed, "recover": recover}
-ACTIVE = ("hop", "missed", "recover")
+STAGES = {"check": check, "discover": discover, "capture": capture, "switch": switch,
+          "hop": hop, "missed": missed, "recover": recover}
+ACTIVE = ("switch", "hop", "missed", "recover")
 
 
 def run(bench, args):
@@ -1021,14 +1049,17 @@ def run(bench, args):
         bench.log.report({"ok": False, "refused": [problem]})
         print("refused, nothing was changed:", problem, sep="\n  ", file=sys.stderr)
         return 1
-    power, problems, warnings = bench.preflight()
+    stay = args.stage == "switch"
+    power, problems, warnings = bench.preflight(stay=stay)
     for warning in warnings:
         print(f"warning: {warning}", file=sys.stderr)
     if problems:
         bench.log.report({"ok": False, "refused": problems})
         print("refused, nothing was changed:", *problems, sep="\n  ", file=sys.stderr)
         return 1
-    move = (f"both radios move between {bench.home['frequency']} and {bench.to['frequency']} MHz "
+    move = (f"both radios move to {bench.to['frequency']} MHz with `message-system chswitch` and "
+            "stay there until the next switch" if stay else
+            f"both radios move between {bench.home['frequency']} and {bench.to['frequency']} MHz "
             "with `message-system chswitch`")
     if not (args.yes or bench.confirm(args.stage, [move])):
         print("cancelled, nothing was changed", file=sys.stderr)
@@ -1037,9 +1068,13 @@ def run(bench, args):
         report = stage(bench, args)
     except (Exception, KeyboardInterrupt) as error:  # whatever happened, the radios go home
         report = {"ok": False, "findings": {"error": f"{type(error).__name__}: {error}"}}
-    report["warnings"], report["restored"] = warnings, bench.restore(power)
+    stays = bool(report.get("stay"))  # a completed `switch` keeps its channel, not its power
+    report["warnings"], report["restored"] = warnings, bench.restore(power, channel=not stays)
     bench.log.report(report)
     print(json.dumps(report["findings"], indent=2, default=str))
+    if stays:
+        print(f"both radios stay on {bench.to['frequency']} MHz until the next switch (back home: "
+              "switch --to with the home JSON)")
     print(f"report: {bench.log.directory}")
     return outcome(report)
 
@@ -1073,7 +1108,8 @@ def parser():
     stages.add_parser("discover", help="read-only: firmware, frequencies, how chswitch is called")
     stage = stages.add_parser("capture", help="read-only: real per-peer data")
     stage.add_argument("--seconds", type=float, default=60)
-    for name, text in (("hop", "switch timing and whether it sticks"),
+    for name, text in (("switch", "one switch that stays until the next: for flights"),
+                       ("hop", "switch timing and whether it sticks"),
                        ("missed", "one radio misses the switch"),
                        ("recover", "RF toggle and reboot against a switched channel")):
         stage = stages.add_parser(name, help=text)
@@ -1087,7 +1123,7 @@ def parser():
         elif name == "missed":
             stage.add_argument("--watch", type=float, default=60,
                                help="s to watch for the radios rejoining by themselves")
-        else:
+        elif name == "recover":
             stage.add_argument("--skip-reboot", action="store_true")
     return top
 

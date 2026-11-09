@@ -831,6 +831,73 @@ class CheckTests(BenchCase):
         self.assertEqual(self.changes(self.a) + self.changes(self.b), [])
 
 
+class SwitchTests(BenchCase):
+    """One switch that stays until the next, for corkscrews of any length."""
+
+    def switch(self, to):
+        status = run(self.bench(to=to), argparse.Namespace(stage="switch", yes=False))
+        return status, self.report()
+
+    def test_a_switch_stays_and_the_next_one_starts_from_there(self):
+        status, report = self.switch(TO)
+        self.assertEqual(status, 0)
+        self.assertEqual((self.a.frequency, self.b.frequency), (TEST, TEST))
+        self.assertEqual(report["findings"]["now_on"], TEST)
+        self.assertEqual(report["restored"]["steps"], [])
+        self.answers = ["yes"]
+        status, report = self.switch(dict(TO, frequency=2470))
+        self.assertEqual(status, 0)
+        self.assertEqual((self.a.frequency, self.b.frequency), (2470, 2470))
+        self.assertEqual(report["findings"]["came_from"], TEST)
+        self.answers = ["yes"]
+        status, _ = self.switch(BACK)  # home is just another switch
+        self.assertEqual(status, 0)
+        self.assertHome()
+
+    def test_radios_on_different_channels_are_refused(self):
+        self.b._tune(2470)
+        status, report = self.switch(TO)
+        self.assertEqual(status, 1)
+        self.assertIn("different channels", " ".join(report["refused"]))
+        self.assertEqual(self.switches(self.a) + self.switches(self.b), [])
+
+    def test_already_there_is_refused(self):
+        for radio in (self.a, self.b):
+            radio._tune(TEST)
+        status, report = self.switch(TO)
+        self.assertEqual(status, 1)
+        self.assertIn(f"already on {TEST}", " ".join(report["refused"]))
+
+    def test_a_switch_that_does_not_complete_goes_home(self):
+        for radio in (self.a, self.b):
+            radio._tune(TEST)
+        self.a.deaf = self.b.deaf = True
+        status, report = self.switch(dict(TO, frequency=2470))
+        self.assertEqual(status, 1)
+        self.assertIsNone(report["findings"]["now_on"])
+        self.assertHome()
+
+    def test_a_power_reset_by_the_switch_is_undone_and_the_channel_kept(self):
+        self.a.switch_resets_power = True
+        status, report = self.switch(TO)
+        self.assertEqual(status, 0)
+        self.assertEqual((self.a.frequency, self.a.txpower), (TEST, 25))
+        self.assertIn("a: tx power 25", report["restored"]["steps"])
+
+    def test_one_wire_a_radio_b_left_on_the_old_channel_is_fetched_from_there(self):
+        self.one_wire()
+        for radio in (self.a, self.b):
+            radio._tune(TEST)
+        self.b.misses = {1}  # b misses this switch and stays where it was
+        status, report = self.switch(dict(TO, frequency=2470))
+        steps = report["restored"]["steps"]
+        self.assertEqual(status, 1)
+        self.assertIn("a: chswitch 2470 to find b", steps)
+        self.assertIn(f"a: chswitch {TEST} to find b", steps)
+        self.assertHome()
+        self.assertEqual(self.rf_toggles(self.b), [])
+
+
 class CommandLineTests(BenchCase):
     def test_main_runs_a_read_only_stage_and_writes_its_run_directory(self):
         radios = {"radio-a": self.a, "radio-b": self.b}

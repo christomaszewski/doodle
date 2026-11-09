@@ -11,6 +11,7 @@ not control.
 | Is everything working? | `check` | Only after the read-only checks pass and you agree | `checks` (also printed as it runs) |
 | How does the firmware call `chswitch`? | `discover` | No | `findings.callers` (`found in …`, `none in N files`, or what kept the search from finishing), then `radios.a.search.hits`, `.strings` and `["config/…"]`; `findings.exec` says whether each radio will run `iw` and ping |
 | What do peer entries hold, and does the service's mapping survive them? | `capture` | No | `peers`, `findings.not_published` |
+| Move both radios to a channel and leave them there (flights) | `switch` | Yes | `findings.now_on`, `findings.came_from` |
 | How long does a switch take? Does it touch saved config or TX power? | `hop` | Yes | `findings.timing`, `findings.saved_config_rewritten`, `findings.tx_power_changed` |
 | What if one radio misses the switch? | `missed` | Yes | `findings.rejoined_by_itself`, `findings.b_landed_on` |
 | Do an RF toggle and a reboot bring a radio home? | `recover` | Yes | `findings.rf_toggle_returns_*_home`, `findings.reboot_returns_home` |
