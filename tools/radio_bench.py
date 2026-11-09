@@ -3,7 +3,8 @@
 
   radio_bench.py --a HOST --b HOST check | discover | capture | hop | missed | recover
 
-Read docs/RADIO_BENCH.md first; this is for two radios on a bench, never a flying vehicle.
+Read docs/RADIO_BENCH.md first. On a flying vehicle, use it only when vehicle control runs over a
+different link: a failed switch costs this link and its data, not control.
 
 - `check` answers "is everything working?", even from a machine wired to radio a alone: read-only
   checks of both radios and of the service's own code against them, then (unless --read-only) a
@@ -347,7 +348,12 @@ class Bench:
             return {"rejected": str(error)}
         except RadioError as error:  # only the answer was lost: the switch may well be happening
             self.log.sample("switch_unconfirmed", error=str(error))
-        return self.watch(target["frequency"])
+        events = self.watch(target["frequency"])
+        # Printed as it happens: in flight the operator starts the next leg on this line.
+        print(f"switch to {target['frequency']} MHz from radio {sender.name}: "
+              + (f"both radios there, data after {events['data']} s" if "data" in events else
+                 f"NOT completed {events}"), flush=True)
+        return events
 
     # --- safety ----------------------------------------------------------------------------------
 
@@ -396,7 +402,8 @@ class Bench:
                   "only radio a is wired to this machine: b is reached through the mesh, and "
                   "there is no shared switch")
         print(f"\n{stage} will change real radios:", *(f"  * {line}" for line in changes),
-              "Agree only if:", "  - nothing is flying, and these two radios are the whole mesh",
+              "Agree only if:", "  - no vehicle control depends on this link, and these two "
+              "radios are the whole mesh",
               "  - you are authorized to transmit on every frequency involved", f"  - {wiring}",
               "  - the doodle service is stopped on both radios", sep="\n")
         return self.ask("Type yes to continue: ").strip().lower() == "yes"
@@ -679,6 +686,7 @@ def hop(bench, args):
     for index in range(args.repeats):
         if not leg(nodes[index % 2], bench.to):
             break
+        print(f"holding {bench.to['frequency']} MHz for {args.dwell:g} s", flush=True)
         bench.sleep(args.dwell)
         during = {node.name: node.saved() for node in nodes}
         for node in nodes:  # the supervisor must re-apply its target if a switch resets the power

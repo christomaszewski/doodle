@@ -2,8 +2,9 @@
 
 `tools/radio_bench.py` answers what the service and the characterization flight need to know from
 two real radios. It has only been run against simulated radios whose `chswitch` behavior is
-invented, so expect the first real run to teach us something. Bench only: never point it at a
-vehicle that can fly.
+invented, so expect the first real run to teach us something. On a flying vehicle, use it only
+when vehicle control runs over a different link: a failed switch costs this link and its data,
+not control.
 
 | Question | Stage | Changes the radios | Read in `report.json` |
 |---|---|---|---|
