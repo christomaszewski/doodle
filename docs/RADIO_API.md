@@ -50,20 +50,25 @@ firewall accepts all incoming connections from the mesh. Fielded radios need a s
 | Reboot detection, load | `system info` | `uptime` (s), `load` (×65536), `memory` |
 | Effective power | `iwinfo info {device}` | `txpower` (int dBm), `channel`, `frequency`, `noise`, `country`, `htmode`, `phy` |
 | Supported power range | `iwinfo txpowerlist {device}` | `results[].dbm` (19…32 on the tested radio), `active` |
-| Automatic power control | `uci get {config:wireless, section:<radio>}` | `values.dynamic_txpower`, `dynamic_txpower_aggr`, `chanbw` |
+| Automatic power control, radio settings | `uci get {config:wireless, section:<radio>}` (the wifi-device section: no key) | `values.dynamic_txpower`, `dynamic_txpower_aggr`, `chanbw`; `distance`, `txpower`, `antenna_gain`, `txantenna`, `rxantenna`, `country`, `htmode` (an allow-list; nothing else is copied) |
 | RF on/off | `network.wireless status` | `<radio>.up` |
 | Link status | `file read {path:/tmp/linkstate_current.json}` | see below |
 | ACK/broadcast power | `file read {path:/sys/kernel/debug/ieee80211/<phy>/ath9k/txpower_selfgen}` (and `txpower_mcast`) | integer dBm, 255 = follow the level |
+| Station table | `iwinfo assoclist {device}` | `results[]`: `mac`, `signal`, `signal_avg`, `noise`, `inactive`, `connected_time`, `thr`, mesh link state, and `rx`/`tx` tables (`rate` kbit/s, `mcs`, `packets`, `bytes`, `retries`, `failed`, …) — standard OpenWrt rpcd; **not yet called on this firmware** |
+| Reverse link, per-peer power limit | `file read {path:/sys/kernel/debug/ieee80211/<phy>/netdev:<device>/stations/<mac>/peer_signal_reply}` (and `fixed_txpower`) | raw text; `fixed_txpower` integer dBm, 255 = none. Format not yet observed |
 | Airtime | `iwinfo survey {device}` | the `results[]` entry whose `mhz` is the operating frequency: `active_time`, `busy_time`, `rx_time`, `tx_time` (ms, cumulative; they restart now and then) |
 | **Set power** | `file exec {command:/usr/sbin/iw, params:[dev,<device>,set,txpower,fixed,<dBm×100>]}` | reply `{code, stdout, stderr}` |
 | **RF off / on** | `network.wireless down` / `up` `{device:<radio>}` | — |
 
 Two sessions: the supervisor's (changes and the reconcile reads) and the diagnostics poll's
-(every 5 s: `system info`, `network.wireless status`, `iwinfo info`, `iwinfo survey`, `uci get`,
-the link report and the two debugfs files; `system board` once and after a reboot). Reading the link report and
-the debugfs files *through the API* is not yet verified on hardware (they were read over SSH):
-an empty or missing debugfs reply is reported as `unsupported`, a failed link-report read as
-`unavailable`.
+(every `health.poll_interval_s`, 5 s by default: `system info`, `network.wireless status`,
+`iwinfo info`, `uci get`, the link report, `iwinfo assoclist`, the two debugfs files and
+`iwinfo survey` — about 9 requests — plus two per-station files for each of up to
+`health.reverse_link_peers` peers; `system board` once and after a reboot). Reading the link
+report and the debugfs files *through the API* is not yet verified on hardware (they were read
+over SSH): an empty or missing debugfs reply is reported as `unsupported`, a failed link-report
+read as `unavailable`. A method the firmware lacks (`iwinfo survey`, `iwinfo assoclist`: ubus
+status 3 or 8) is reported as `unsupported` and not asked again until the radio reboots.
 
 Never called: `link-status logs` (exports the long-term log as an archive in `/tmp`, which is
 RAM), anything that commits UCI or writes flash.
@@ -134,7 +139,9 @@ peers:
 Configured to include per-peer RSSI, inactive time, packet loss (`pl_ratio`), TX rate/MCS/width,
 mesh TQ, hop status, last seen, `fixed_txpower` and average bitrate. The per-peer entry format is
 **not yet observed**. `sysinfo.localtime` is the radio clock, which is wrong (no time sync) — use
-host receipt time.
+host receipt time. It does advance with each rewrite, so the service uses it to tell a new report
+from the previous one: a report unchanged for more than 6 s (three rewrites) means the radio's
+linkstate service has stopped.
 
 ## Not available
 
@@ -153,7 +160,10 @@ host receipt time.
 
 ## Not yet verified (needs a second radio)
 
-- Per-peer formats in `linkstate` and the debugfs station files.
+- Per-peer formats in `linkstate` and the debugfs station files (`peer_signal_reply`,
+  `fixed_txpower`) read through the API.
+- Whether `iwinfo assoclist` answers through the API on this firmware, and what it lists for
+  mesh peers.
 - Automatic power control against a fixed level with a close peer.
 - Reported vs. radiated power (signal-strength change on a peer).
 - Whether a live power change interrupts the link.

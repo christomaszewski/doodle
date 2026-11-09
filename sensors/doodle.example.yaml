@@ -64,6 +64,19 @@ tx_power:
 #     rf.noise_dbm: {warn_above: -85}     # e.g. warn on a noisy channel
 #     link.signal_dbm: {warn_below: -80}  # e.g. warn per peer on a weak signal (also link.snr_db,
 #                                         #   link.loss_pct, mesh.quality_pct)
+#   peers:                      # optional names for peers (quote the MAC): link.name and messages
+#     "00:30:1a:12:34:57": gcs
+#   reverse_link_peers: 4       # peers whose per-station power-control files are read each poll
+#                               #   (2 radio requests per peer per poll; 0 = off)
+#
+# Network characterization flights: poll every second so link data is about 1 s apart rather
+# than 5 (at 20 m/s that is 20 m between samples instead of 100 m), and expire data sooner:
+# health:
+#   poll_interval_s: 1
+#   stale_after_s: 5
+# Each poll is about 9 radio requests plus 2 per reverse-link peer; check system.load_1m on the
+# bench at this rate before flying. The link report only changes every 2 s; the station table
+# (link.iw_*, link.signal_dbm, link.rate_mbps) is live. Record /diagnostics and /rosout.
 
 # Zenoh session settings (only with RMW_IMPLEMENTATION=rmw_zenoh_cpp); same block as the other rig
 # ROS services. `overrides` (nested config flattened to path=json pairs) is the useful part here;

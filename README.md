@@ -52,6 +52,18 @@ ros2 param set /mesh/radio tx_power medium      # same values as tx-power, excep
 supported, capped by `max_dbm`), `off`, whole dBm, or `unchanged` (the default for both startup
 and shutdown). Out-of-range requests are rejected; the radio itself clamps silently.
 
+## Network characterization flights
+
+Set `health.poll_interval_s: 1` and `health.stale_after_s: 5` (see the example config), name the
+peers under `health.peers`, and record `/diagnostics` and `/rosout` (the rig-infra ROS 2 bag
+logger records both by default). Per peer, `link/<mac>` then carries the live station table
+(`link.iw_*`: signal, rates, MCS, cumulative packets, bytes, retries and failures),
+`link.signal_dbm`, `link.snr_db`, `link.rate_mbps` and the reverse link files; `radio` carries
+power, channel, noise, airtime and the radio's settings; `/rosout` carries every power change.
+Each observation is published once when it is read; `health.sample_id` identifies it and
+`health.sample_age_s` dates it. Check the radio's `system.load_1m` at this rate on the bench
+first. Position, attitude and active throughput/latency tests come from other services.
+
 ## Deploying with rig
 
 The service is an `infra` stack (`rigging.yaml`): rig starts it before every sensor and autonomy
