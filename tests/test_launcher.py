@@ -52,7 +52,8 @@ class LauncherTests(unittest.TestCase):
         self.env = {k: v for k, v in os.environ.items()
                     if not k.startswith(("DOODLE_", "RIG_", "COMPOSE_"))}
         self.env.update(PATH=f"{bin_dir}:{self.env['PATH']}", ARGV_LOG=str(self.argv),
-                        ENV_LOG=str(self.envlog), DOODLE_SETTLE_TIMEOUT="2", DOODLE_CONNECT_TIMEOUT="2")
+                        ENV_LOG=str(self.envlog), DOODLE_START_TIMEOUT="2",
+                        DOODLE_SETTLE_TIMEOUT="2", DOODLE_CONNECT_TIMEOUT="2")
 
     def write_config(self, password=PASSWORD, **overrides):
         doc = yaml.safe_load((ROOT / "sensors/doodle.example.yaml").read_text())

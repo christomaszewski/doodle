@@ -109,7 +109,9 @@ tx_power:
 #   ZENOH_CONFIG_OVERRIDE   optional path=json;... pairs applied before the config's zenoh block
 #   DOODLE_IMAGE            full image override; else [RIG_IMAGE_REGISTRY/]doodle_radio:RIG_IMAGE_TAG
 #   COMPOSE_PROJECT_NAME    rig-supplied project; standalone defaults to service_name
-#   DOODLE_CONNECT_TIMEOUT  seconds `up -d` waits for the radio to answer at all (default 10)
-#   DOODLE_SETTLE_TIMEOUT   seconds `up -d` then waits for the target power (default 120)
+#   DOODLE_START_TIMEOUT    seconds `up -d` waits for the container's supervisor to answer
+#                           (default 30; a cold start takes several seconds)
+#   DOODLE_CONNECT_TIMEOUT  seconds it then waits for the supervisor to reach the radio (default 10)
+#   DOODLE_SETTLE_TIMEOUT   seconds it then waits for the target power (default 120)
 #   RIG_SIM_TIME            set by rig in replay/simulation sessions; see ros.use_sim_time
 #   DOODLE_PYTHON           launcher Python interpreter (default python3; requires PyYAML)

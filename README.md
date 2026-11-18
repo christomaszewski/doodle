@@ -66,6 +66,13 @@ Each observation is published once when it is read; `health.sample_id` identifie
 `health.sample_age_s` dates it. Check the radio's `system.load_1m` at this rate on the bench
 first. Position, attitude and active throughput/latency tests come from other services.
 
+That is one of two recordings, and they are independent. The other is characterization mode
+(`characterization.enabled`): raw JSON snapshots of this radio and of the GCS radio on
+`/<namespace>/radio/characterization`, for the analysis that needs both ends of the link.
+[docs/FIELD_TEST.md](docs/FIELD_TEST.md) is the flight procedure and is built on that mode. Both
+read the per-station power-control files, so with both on, set `health.reverse_link_peers: 0` if
+the radio's load matters more than having those values in `/diagnostics` too.
+
 ## Deploying with rig
 
 The service is an `infra` stack (`rigging.yaml`): rig starts it before every sensor and autonomy
@@ -122,9 +129,11 @@ built from rig-infra with the network off), runs the supervisor and ROS suites i
 
 ## Portable builds and replay startup
 
-Detached startup allows 10 seconds for first radio reachability, then 120 seconds for power
-reconciliation. Set `DOODLE_CONNECT_TIMEOUT` or `DOODLE_SETTLE_TIMEOUT` in the launcher's environment
-to change those budgets. Status polling is bounded and reads the supervisor's cached `ready` response;
+Detached startup has three budgets, each starting when the one before it is met: 30 seconds for
+the container's supervisor to answer at all (a cold start, as after a boot, takes several seconds
+before any code of the service runs), then 10 seconds for first radio reachability, then 120
+seconds for power reconciliation. Set `DOODLE_START_TIMEOUT`, `DOODLE_CONNECT_TIMEOUT` or
+`DOODLE_SETTLE_TIMEOUT` in the launcher's environment to change them. Status polling is bounded and reads the supervisor's cached `ready` response;
 it does not issue extra radio requests. A timeout returns failure and leaves background retries running.
 
 Rig replay omits this live radio service by default and keeps its recorded bag topics. Use
