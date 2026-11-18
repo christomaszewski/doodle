@@ -12,6 +12,7 @@ not control.
 | How does the firmware call `chswitch`? | `discover` | No | `findings.callers` (`found in …`, `none in N files`, or what kept the search from finishing), then `radios.a.search.hits`, `.strings` and `["config/…"]`; `findings.exec` says whether each radio will run `iw` and ping |
 | What do peer entries hold, and does the service's mapping survive them? | `capture` | No | `peers`, `findings.not_published` |
 | Move both radios to a channel and leave them there (flights) | `switch` | Yes | `findings.now_on`, `findings.came_from` |
+| Fly a whole channel plan, one switch per Enter, home at the end | `fly` | Yes | `findings.flown_mhz`, `findings.not_completed_mhz`, `findings.timing`, `legs[].at_utc` |
 | How long does a switch take? Does it touch saved config or TX power? | `hop` | Yes | `findings.timing`, `findings.saved_config_rewritten`, `findings.tx_power_changed` |
 | What if one radio misses the switch? | `missed` | Yes | `findings.rejoined_by_itself`, `findings.b_landed_on` |
 | Do an RF toggle and a reboot bring a radio home? | `recover` | Yes | `findings.rf_toggle_returns_*_home`, `findings.reboot_returns_home` |
@@ -145,6 +146,31 @@ channel switch it could not start (the radios are not on `--home`, say) is a FAI
 moved.
 
 Exit status: 0 done, 1 a failed check or refusal, 3 **a radio was not restored**.
+
+## A flight's channel plan in one command
+
+`fly` is `switch` for a whole flight: the list of test frequencies once, then one switch per
+Enter, and home at the end.
+
+```bash
+python3 tools/radio_bench.py --a <radio-a> --b <radio-b> fly --home '<json>' --channels 2412 2437 2462
+```
+
+- Before anything moves it checks what every active stage checks (both radios up and together
+  on home, exactly one peer, data crossing) and that both radios list every frequency in the
+  plan, then asks once.
+- Every step sends `--home`'s own arguments with only the frequency changed, so the arguments
+  proven on the bench are the ones that fly.
+- At each prompt: Enter switches to the channel shown, `s` skips it, `h` goes home now and ends
+  the plan. Before each switch the link is checked again; if no data crosses at that moment,
+  nothing is sent and the same step is offered again.
+- After each switch it puts back the starting transmit power if the switch changed it, so
+  every leg is flown at one power.
+- A switch that does not complete brings both radios home, says so, and offers the same step
+  again. Ctrl-C, or the end of the plan, brings both radios home as every stage does.
+
+`report.json` lists each leg with the UTC time of its switch (`legs[].at_utc`), for lining the
+legs up with the recording.
 
 ## If a radio is stranded
 

@@ -993,6 +993,151 @@ class SwitchTests(BenchCase):
         self.assertEqual(self.rf_toggles(self.b), [])
 
 
+class FlyTests(BenchCase):
+    """A flight's channel plan from one command: one switch per Enter, home at the end."""
+
+    def fly(self, *channels, answers=("yes",), yes=False, **overrides):
+        self.answers = list(answers)
+
+        def ask(_):
+            answer = self.answers.pop(0)
+            if isinstance(answer, BaseException):
+                raise answer
+            return answer() if callable(answer) else answer
+        bench = self.bench(to=None, ask=ask, **overrides)
+        status = run(bench, argparse.Namespace(stage="fly", yes=yes, channels=list(channels)))
+        written = (Path(self.directory.name) / "report.json").exists()
+        return status, self.report() if written else None  # a declined run writes none
+
+    def sent(self, radio):
+        return [call[2]["frequency"] for call in self.switches(radio)]
+
+    def test_a_plan_is_flown_one_enter_per_switch_and_ends_home(self):
+        status, report = self.fly(2470, TEST, answers=["yes", "", "", ""])
+        self.assertEqual(status, 0)
+        self.assertEqual(self.sent(self.a), [2470, TEST, HOME])  # one request per step, to a
+        self.assertEqual(self.sent(self.b), [])
+        findings = report["findings"]
+        self.assertEqual(findings["plan_mhz"], [2470, TEST, HOME])
+        self.assertEqual(findings["flown_mhz"], [2470, TEST, HOME])
+        self.assertEqual(findings["switches_completed"], "3/3")
+        self.assertEqual(findings["timing"]["data"]["count"], 3)
+        self.assertTrue(all("at_utc" in leg for leg in report["legs"]))
+        self.assertTrue(report["restored"]["ok"])
+        self.assertEqual(self.answers, [])  # one prompt per step, no more
+        self.assertHome()
+
+    def test_every_step_uses_the_home_arguments_with_only_the_frequency_changed(self):
+        self.fly(2470, answers=["yes", "", ""])
+        for call in self.switches(self.a):
+            self.assertEqual({**call[2], "frequency": HOME}, BACK)
+
+    def test_the_whole_plan_is_checked_before_the_first_switch(self):
+        for channels, reason in (((2470, 2600), "does not list 2600"),  # not only the first step
+                                 ((2470, HOME), "home frequency"),
+                                 ((2470, 2470), "twice in a row"), ((), "empty")):
+            with self.subTest(channels=channels):
+                status, report = self.fly(*channels, answers=["yes", "", "", ""])
+                self.assertEqual(status, 1)
+                self.assertIn(reason, " ".join(report["refused"]))
+                self.assertEqual(self.answers[0], "yes")  # refused before it even asked
+        self.assertEqual(self.changes(self.a) + self.changes(self.b), [])
+
+    def test_it_starts_from_home_with_one_peer_and_data_like_every_stage(self):
+        self.b.extra_peers = [{"mac": "00:30:1a:00:00:0c", "rssi": -70}]
+        status, report = self.fly(2470, answers=["yes", "", ""])
+        self.assertEqual(status, 1)
+        self.assertIn("mesh-wide", " ".join(report["refused"]))
+        self.assertEqual(self.changes(self.a) + self.changes(self.b), [])
+
+    def test_declining_changes_nothing(self):
+        status, _ = self.fly(2470, TEST, answers=["no"])
+        self.assertEqual(status, 1)
+        self.assertEqual(self.changes(self.a) + self.changes(self.b), [])
+
+    def test_a_channel_can_be_skipped_and_home_taken_early(self):
+        status, report = self.fly(2470, TEST, 2460, answers=["yes", "s", "", "h"])
+        self.assertEqual(status, 0)
+        self.assertEqual(self.sent(self.a), [TEST, HOME])
+        self.assertEqual(report["findings"]["skipped_mhz"], [2470, 2460])
+        self.assertEqual(report["findings"]["flown_mhz"], [TEST, HOME])
+        self.assertHome()
+
+    def test_home_taken_before_any_switch_sends_nothing(self):
+        status, _ = self.fly(2470, TEST, answers=["yes", "h"])
+        self.assertEqual(status, 0)
+        self.assertEqual(self.changes(self.a) + self.changes(self.b), [])
+
+    def test_a_switch_that_does_not_complete_comes_home_and_the_plan_goes_on(self):
+        self.b.misses = {1}  # radio b misses the first switch: the mesh is split
+        status, report = self.fly(2470, TEST, answers=["yes", "", "s", "", ""])
+        self.assertEqual(status, 1)  # a leg was lost, and the exit status says so
+        self.assertEqual(report["findings"]["not_completed_mhz"], [2470])
+        self.assertEqual(report["findings"]["flown_mhz"], [TEST, HOME])
+        self.assertTrue(report["legs"][0]["restored"]["ok"])  # home again before the next prompt
+        self.assertTrue(report["restored"]["ok"])
+        self.assertHome()
+
+    def test_ctrl_c_at_a_hold_brings_both_radios_home(self):
+        status, report = self.fly(2470, TEST, answers=["yes", "", KeyboardInterrupt()])
+        self.assertEqual(status, 1)
+        self.assertIn("KeyboardInterrupt", report["findings"]["error"])
+        self.assertEqual(report["findings"]["flown_mhz"], [2470])
+        self.assertHome()
+
+    def test_no_switch_is_sent_while_no_data_crosses_the_link(self):
+        """At a hold the link carries no data (range, a turn): a `chswitch` now is the one the
+        vehicle radio would miss. Nothing is sent; the same step is offered again."""
+        def link_down():
+            self.a.no_data_on = {2470}
+            return ""
+
+        def link_back():
+            self.a.no_data_on = set()
+            return ""
+        status, report = self.fly(2470, TEST, answers=["yes", "", link_down, link_back, ""])
+        self.assertEqual(status, 0)
+        self.assertEqual(self.sent(self.a), [2470, TEST, HOME])
+        refused = [leg for leg in report["legs"] if "refused" in leg]
+        self.assertEqual([leg["to"] for leg in refused], [TEST])
+        self.assertIn("no data", " ".join(refused[0]["refused"]))
+        self.assertHome()
+
+    def test_a_power_reset_by_a_switch_is_undone_for_every_leg(self):
+        for radio in (self.a, self.b):
+            radio.switch_resets_power = True
+        seen = []
+
+        def at_hold():  # what the leg just flown was flown at
+            seen.append((self.a.txpower, self.b.txpower))
+            return ""
+        status, report = self.fly(2470, TEST, answers=["yes", "", at_hold, at_hold])
+        self.assertEqual(status, 0)
+        self.assertEqual(seen, [(25, 25), (25, 25)])
+        self.assertEqual(report["findings"]["tx_power_changed"]["a"], {"from": 25, "to": 32})
+        self.assertHome()
+
+    def test_an_unknown_answer_asks_again(self):
+        status, _ = self.fly(2470, answers=["yes", "go", "", ""])
+        self.assertEqual(status, 0)
+        self.assertEqual(self.sent(self.a), [2470, HOME])
+
+    def test_it_works_over_one_wire(self):
+        self.one_wire()
+        status, report = self.fly(2470, TEST, answers=["yes", "", "", ""])
+        self.assertEqual(status, 0)
+        self.assertEqual(report["findings"]["switches_completed"], "3/3")
+        self.assertEqual(self.rf_toggles(self.a) + self.rf_toggles(self.b), [])
+        self.assertHome()
+
+    def test_the_command_line(self):
+        args = radio_bench.parser().parse_args(
+            ["--a", "x", "--b", "y", "fly", "--home", json.dumps(BACK), "--channels", "2470",
+             "2480"])
+        self.assertEqual((args.stage, args.channels, args.home), ("fly", [2470, 2480], BACK))
+        self.assertFalse(args.yes)
+
+
 class CommandLineTests(BenchCase):
     def test_main_runs_a_read_only_stage_and_writes_its_run_directory(self):
         radios = {"radio-a": self.a, "radio-b": self.b}

@@ -2,7 +2,7 @@
 
 Everything to configure and run before and during a characterization flight, in order. Nothing
 here has been run end to end on real radios yet: on the bench, `discover` and `check --read-only`
-have; the channel switch, `hop` and characterization mode have not.
+have; the channel switch, `hop`, `fly` and characterization mode have not.
 
 Placeholders are in angle brackets. Two machines are involved:
 
@@ -128,6 +128,15 @@ ros2 topic echo --once /<namespace>/radio/characterization
 again on the GCS laptop, and check `oper_freq` in both radios' `linkstate` moves to the test
 frequency and back.
 
+**3.7 The flight's own plan.** Run the command you will fly with (section 5), on the bench, with
+the real channel list, pressing Enter through every step. Pass: one
+`both radios stay on <MHz>: fly this leg` per channel, `switches_completed` N/N, and exit status 0.
+This is the only check that every frequency in the plan works, not just `TEST_MHZ`.
+
+```bash
+python3 tools/radio_bench.py --a $GCS --b $VEHICLE fly --home "$(sw $HOME_MHZ)" --channels <mhz> <mhz> <mhz> <mhz>
+```
+
 ## 4. Ground test on the vehicle
 
 Vehicle on the ground, radios as they will fly, about the flight distance apart if possible. Run
@@ -159,16 +168,31 @@ Then confirm both radios, on the ground:
 python3 tools/radio_bench.py --a $GCS --b $VEHICLE check --read-only
 ```
 
-**In flight**, fly the first home-channel corkscrew without the tool. Then, at each 10 m hold,
-switch both radios to the next channel and leave them there, so each corkscrew takes as long as
-it takes. Type `yes` at the prompt (or add `--yes` once you trust it) and start the corkscrew when
-it prints `both radios stay on <MHz>`:
+**In flight**, one command holds the whole channel plan. Start it on the ground: it checks both
+radios and every frequency in the plan, asks once (type `yes`), then waits at its first prompt.
+
+```bash
+python3 tools/radio_bench.py --a $GCS --b $VEHICLE fly --home "$(sw $HOME_MHZ)" --channels <mhz> <mhz> <mhz> <mhz>
+```
+
+Fly the first home-channel corkscrew with it waiting. Then, at each 10 m hold, press Enter: it
+checks the link, switches both radios, and prints `both radios stay on <MHz>: fly this leg`. Start
+the corkscrew on that line. After the last test channel, Enter switches home for the last home
+corkscrew, and the command ends.
+
+- `s` and Enter skips the channel shown; `h` and Enter goes home now and ends the plan.
+- `not switching, nothing was changed` means the link did not carry data at that moment. Hold,
+  and press Enter again.
+- Ctrl-C at any point brings both radios home and ends.
+
+The same by hand, one command per hold, if you would rather not keep a program waiting through
+the flight (type `yes` at each prompt, or add `--yes`):
 
 ```bash
 python3 tools/radio_bench.py --a $GCS --b $VEHICLE switch --to "$(sw <channel-mhz>)" --home "$(sw $HOME_MHZ)"
 ```
 
-After the last test channel, switch home the same way and fly the last home corkscrew:
+and after the last test channel, home:
 
 ```bash
 python3 tools/radio_bench.py --a $GCS --b $VEHICLE switch --to "$(sw $HOME_MHZ)" --home "$(sw $HOME_MHZ)"

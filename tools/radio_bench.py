@@ -1072,6 +1072,130 @@ def channel_round_trip(bench, items):
         items.add("PASS", name, f"data after {events['data']} s")
 
 
+def fly(bench, args):
+    """A flight's channel plan from one command: each of --channels in order, then home, one
+    switch per Enter. Each step is a `switch`: checked first, one request to radio a, confirmed
+    by data crossing the mesh, and left in place until the next. Every step sends --home's own
+    arguments with only the frequency changed, so what the bench proved is what flies. However
+    the plan ends (its last step, `h`, Ctrl-C, a switch that did not complete), both radios are
+    brought home and back to their starting power. -> exit status, like run()."""
+    home = bench.home
+    plan = [dict(home, frequency=mhz) for mhz in args.channels] + [home]
+    names = [step["frequency"] for step in plan]
+    problems, warnings, power = [], [], {}
+    if not args.channels:
+        problems.append("--channels is empty")
+    if home["frequency"] in args.channels:
+        problems.append(f"--channels lists the home frequency {home['frequency']} MHz: the "
+                        "plan ends there by itself")
+    if any(first == second for first, second in zip(args.channels, args.channels[1:])):
+        problems.append("--channels lists a frequency twice in a row")
+    if not problems:
+        bench.to = plan[0]
+        power, problems, warnings = bench.preflight()  # together at home, one peer, data
+        for node in bench.nodes:  # the whole plan now: nothing should be found out in the air
+            try:
+                supported = node.frequencies()
+            except RadioError:
+                continue  # preflight has already said this radio is not up
+            problems += [f"radio {node.name} does not list {mhz} MHz"
+                         for mhz in args.channels[1:] if supported and mhz not in supported]
+    for warning in warnings:
+        print(f"warning: {warning}", file=sys.stderr)
+    if problems:
+        bench.log.report({"ok": False, "refused": problems})
+        print("refused, nothing was changed:", *problems, sep="\n  ", file=sys.stderr)
+        return 1
+    changes = [f"both radios leave {home['frequency']} MHz for " + ", then ".join(
+                   f"{mhz} MHz" for mhz in names) + " (home)",
+               "one `message-system chswitch` request per step, sent when you press Enter; each "
+               "step keeps its channel until the next"]
+    if not (args.yes or bench.confirm("fly", changes)):
+        print("cancelled, nothing was changed", file=sys.stderr)
+        return 1
+
+    legs, power_changed, error = [], {}, None
+    try:
+        index, go = 0, False  # go: home was asked for, so the home step needs no second Enter
+        while index < len(plan):
+            target, last = plan[index], index == len(plan) - 1
+            mhz = target["frequency"]
+            if last and all(bench.on(node, mhz) for node in bench.nodes):
+                break  # already home: everything was skipped, or a failed switch came back
+            if not go:
+                where = "home" if last else f"channel {index + 1} of {len(plan) - 1}"
+                answer = bench.ask(f"\n[{where}] Enter = switch to {mhz} MHz"
+                                   + ("" if last else ", s = skip it, h = home now")
+                                   + ": ").strip().lower()
+                if not last and answer in ("s", "skip"):
+                    legs.append({"to": mhz, "skipped": True})
+                    index += 1
+                    continue
+                if not last and answer in ("h", "home"):
+                    legs.extend({"to": step["frequency"], "skipped": True}
+                                for step in plan[index:-1])
+                    index, go = len(plan) - 1, True
+                    continue
+                if answer:
+                    print(f"not understood: {answer!r}", file=sys.stderr)
+                    continue
+            bench.to = target
+            _, problems, _ = bench.preflight(stay=True)
+            if problems:
+                # Most likely the link, at this hold: a `chswitch` now is the one radio b misses.
+                legs.append({"to": mhz, "refused": problems})
+                print("not switching, nothing was changed:", *problems, sep="\n  ",
+                      file=sys.stderr)
+                if last:
+                    break  # the way home is restore()'s, below
+                continue  # the same step again, at the next Enter
+            events = bench.move(bench.a, target)
+            leg = {"to": mhz, "sender": "a", "events": events,
+                   "at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+            legs.append(leg)
+            if "data" not in events:
+                if last:
+                    break
+                with finishing():
+                    leg["restored"] = bench.restore(power)
+                if not leg["restored"]["ok"]:
+                    break
+                print(f"the switch to {mhz} MHz did not complete: both radios are back on "
+                      f"{home['frequency']} MHz. Enter tries it again, s skips it.",
+                      file=sys.stderr)
+                continue
+            for node in bench.nodes:  # every leg flies at one power, whatever a switch does to it
+                now = bench.look(node)["tx_power"]
+                if isinstance(power.get(node.name), int) and now != power[node.name]:
+                    power_changed.setdefault(node.name, {"from": power[node.name], "to": now})
+            bench.restore(power, channel=False)
+            index += 1
+            if not last:
+                print(f"both radios stay on {mhz} MHz: fly this leg", flush=True)
+    except (Exception, KeyboardInterrupt) as failure:  # whatever happened, the radios go home
+        error = f"{type(failure).__name__}: {failure}"
+
+    done = [leg for leg in legs if "data" in leg.get("events", {})]
+    lost = [leg["to"] for leg in legs if "events" in leg and "data" not in leg["events"]]
+    report = {"ok": error is None and not lost, "legs": legs, "warnings": warnings, "findings": {
+        "plan_mhz": names, "switches_completed": f"{len(done)}/{len(plan)}",
+        "flown_mhz": [leg["to"] for leg in done], "not_completed_mhz": lost,
+        "skipped_mhz": [leg["to"] for leg in legs if leg.get("skipped")],
+        "timing": timing(done), "tx_power_changed": power_changed}}
+    if error:
+        report["findings"]["error"] = error
+    try:
+        with finishing():
+            report["restored"] = bench.restore(power)
+    finally:
+        report.setdefault("restored", {"ok": False, "at_home": False, "state": {},
+                                       "steps": ["restore did not finish"]})
+        bench.log.report(report)
+    print(json.dumps(report["findings"], indent=2, default=str))
+    print(f"report: {bench.log.directory}")
+    return outcome(report)
+
+
 STAGES = {"check": check, "discover": discover, "capture": capture, "switch": switch,
           "hop": hop, "missed": missed, "recover": recover}
 ACTIVE = ("switch", "hop", "missed", "recover")
@@ -1079,6 +1203,8 @@ ACTIVE = ("switch", "hop", "missed", "recover")
 
 def run(bench, args):
     """-> exit status: 0 done, 1 a finding or a refusal, 3 radios not restored."""
+    if args.stage == "fly":  # its own prompts, checks and restores between steps
+        return fly(bench, args)
     stage = STAGES[args.stage]
     if args.stage == "check":
         report = stage(bench, args)
@@ -1171,6 +1297,17 @@ def parser():
     stages.add_parser("discover", help="read-only: firmware, frequencies, how chswitch is called")
     stage = stages.add_parser("capture", help="read-only: real per-peer data")
     stage.add_argument("--seconds", type=float, default=60)
+    stage = stages.add_parser("fly", help="a flight's channel plan: one switch per Enter, "
+                              "home at the end")
+    stage.add_argument("--home", type=switch_args, required=True,
+                       help="chswitch JSON for the home channel; every step sends it with only "
+                       "the frequency changed")
+    stage.add_argument("--channels", type=int, nargs="+", required=True, metavar="MHZ",
+                       help="test frequencies in flight order (not home: the plan ends there)")
+    stage.add_argument("--timeout", type=float, default=90, help="s to wait for one switch")
+    stage.add_argument("--yes", action="store_true",
+                       help="skip the one confirmation at the start (each step still waits for "
+                       "Enter)")
     for name, text in (("switch", "one switch that stays until the next: for flights"),
                        ("hop", "switch timing and whether it sticks"),
                        ("missed", "one radio misses the switch"),
@@ -1211,8 +1348,8 @@ def finishing():
     def wait(*_):
         print("still bringing the radios home; this ends by itself", file=sys.stderr, flush=True)
 
-    print("bringing both radios home (up to a few minutes); do not interrupt", file=sys.stderr,
-          flush=True)
+    print("making sure both radios are home at their starting power: do not interrupt, it "
+          "ends by itself", file=sys.stderr, flush=True)
     previous = {}
     for name in ("SIGINT", "SIGTERM", "SIGHUP"):
         number = getattr(signal, name, None)
