@@ -33,6 +33,8 @@ from radio_api import RadioError
 LOG = logging.getLogger("doodle.health")
 PARAMETER = "tx_power"
 START_TIMEOUT = 60  # s; e.g. an RMW waiting for an unreachable Zenoh router
+TEARDOWN_BUDGET = 10  # s to stop ROS; with supervisor.SHUTDOWN_BUDGET it must stay inside
+#                       compose's 60 s stop grace period (tests/test_supervisor.py checks)
 OFF_REFUSED = ("off is refused over ROS (it could switch off the link the request arrived on); "
                "use `doodle-up <config> tx-power off` on the vehicle")
 
@@ -127,7 +129,11 @@ class ParameterBridge:
     def set(self, value):
         """-> (accepted, reason). Applies the request; may block while the radio changes."""
         startup = isinstance(value, str) and value.strip().lower() == "startup"
-        if not startup:
+        if startup:
+            # Another spelling of tx_power.startup: refused like `off` when that is what it is.
+            if self.controller.settings["startup"] == "off" and self.controller.target != "off":
+                return False, OFF_REFUSED
+        else:
             try:
                 target = doodle_config.power_value(value, PARAMETER)
             except ValueError as error:
@@ -291,13 +297,16 @@ class RosHealth:
         self.spin_stop.set()
         if self.executor is not None:
             self.executor.wake()
+        # One budget for all of it (the shutdown power is already applied; what is left of
+        # compose's stop grace period is short). A poll can be inside a radio request; the
+        # threads are daemons, so one that has not finished by then is left behind.
+        deadline = time.monotonic() + TEARDOWN_BUDGET
         for thread in self.threads:
-            # A poll can be inside one bounded radio request; it is a daemon either way.
-            thread.join(timeout=5)
+            thread.join(timeout=max(0.0, deadline - time.monotonic()))
         if self.collector is not None:
             self.collector.close()
         if self.executor is not None:
-            self.executor.shutdown(timeout_sec=5)
+            self.executor.shutdown(timeout_sec=max(0.1, deadline - time.monotonic()))
         if self.node is not None:
             self.node.destroy_node()
         if self.context is not None:

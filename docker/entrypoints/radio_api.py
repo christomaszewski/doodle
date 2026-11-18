@@ -57,6 +57,16 @@ class UbusError(ReplyError):
         super().__init__(f"{what}: {UBUS_STATUS.get(status, f'ubus status {status}')}")
 
 
+def _not_json(constant):
+    raise ValueError(f"{constant} is not JSON")
+
+
+def strict_json(text):
+    """Python's json accepts NaN and Infinity. A radio reply holding one is malformed: nothing
+    downstream (diagnostics values, the tx-power status JSON) may carry them."""
+    return json.loads(text, parse_constant=_not_json)
+
+
 class RadioAPI:
     def __init__(self, host, username, password, *, scheme="https", port=None, fingerprint="",
                  device="wlan0", uci_radio="radio0", timeout=5.0, transport=None):
@@ -128,7 +138,7 @@ class RadioAPI:
                 if response.status != 200:
                     self.close()
                     raise RadioError(f"radio answered HTTP {response.status} on /ubus")
-                return json.loads(data)
+                return strict_json(data)
             except RadioError:
                 self.close()
                 raise
@@ -173,8 +183,14 @@ class RadioAPI:
 
     def _login(self):
         self._session = None
+        password = self._password
+        if callable(password):  # read at every login, so a rotated password is picked up
+            try:
+                password = password()
+            except RuntimeError as error:
+                raise AuthError(str(error)) from None
         reply = self._rpc([NULL_SESSION, "session", "login",
-                           {"username": self.username, "password": self._password}], None)
+                           {"username": self.username, "password": password}], None)
         try:
             if reply.get("error"):
                 raise UbusError("login", 6)
@@ -234,9 +250,11 @@ class RadioAPI:
     def board(self):
         data = self.call("system", "board")
         release = data.get("release") if isinstance(data.get("release"), dict) else {}
-        return {"hostname": data.get("hostname"), "model": data.get("model"),
-                "parent_model": data.get("parent_model"), "sub_model": data.get("sub_model"),
-                "firmware": release.get("version")}
+        fields = {"hostname": data.get("hostname"), "model": data.get("model"),
+                  "parent_model": data.get("parent_model"), "sub_model": data.get("sub_model"),
+                  "firmware": release.get("version")}
+        # Identity strings only: they become the hardware ID and a status message.
+        return {key: value if isinstance(value, str) else None for key, value in fields.items()}
 
     def system_info(self):
         data = self.call("system", "info")
@@ -283,6 +301,8 @@ class RadioAPI:
     def power_control(self):
         values = self.call("uci", "get", {"config": "wireless", "section": self.uci_radio}) \
                      .get("values") or {}
+        if not isinstance(values, dict):
+            raise ReplyError("uci.get: malformed reply")
         settings = {key: values[key] for key in RADIO_SETTINGS
                     if isinstance(values.get(key), (str, int, float))
                     and not isinstance(values.get(key), bool)}

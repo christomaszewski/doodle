@@ -154,6 +154,9 @@ link report without its wrong radio clock (its own `oper_freq` labels samples ri
 switch), the operating channel's airtime counters, `iw station dump`, and ath9k_tpcd's per-peer
 files (`peer_signal_reply` is how the peer hears this radio). A failed read is recorded in place as
 `{"error": …}`; a radio that cannot be reached is `{"unreachable": …}`, at one request per poll.
+A radio that stops answering part-way through a poll (the link faded) keeps what was read and
+gains `unreachable`; the reads left are skipped, so its timeouts do not hold back the other
+radio's samples.
 
 The GCS radio is reached with this radio's API password, over its own sessions with 2 s timeouts.
 Nothing in this mode writes to either radio: channel changes come from `tools/radio_bench.py`.

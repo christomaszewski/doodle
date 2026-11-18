@@ -92,6 +92,20 @@ class LauncherTests(unittest.TestCase):
             self.assertIn("render_config:", result.stderr)
             self.assertEqual(set(self.calls().splitlines()), {"docker compose version"})
 
+    def test_a_yaml_error_never_echoes_the_password(self):
+        # An unquoted password starting with ! or * is the mistake the example config warns
+        # about; PyYAML's message for it quotes the "tag" or "alias", i.e. the password.
+        example = (ROOT / "sensors/doodle.example.yaml").read_text()
+        for unquoted in ("!Unquoted-Pw-123", "*Unquoted-Pw-123"):
+            self.config.write_text(example.replace('"{{doodle_radio_password}}"', unquoted))
+            self.assertIn(unquoted, self.config.read_text())
+            result = self.run_launcher("config")
+            self.assertEqual(result.returncode, 2, unquoted)
+            self.assertNotIn("Unquoted-Pw-123", result.stdout + result.stderr)
+            self.assertRegex(result.stderr, r"line \d+")       # where to look
+            self.assertIn("quote", result.stderr)               # and what to do
+            self.assertNotIn(" config", self.calls())           # compose never ran
+
     def test_up_writes_the_secret_privately_and_down_removes_it(self):
         result = self.run_launcher("up", "-d")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -104,6 +118,30 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(self.secret.read_text(), "Rotated-Password-2")
         self.assertEqual(self.run_launcher("down").returncode, 0)
         self.assertFalse(self.secret.exists())
+
+    def test_a_rotated_password_reaches_the_running_container(self):
+        """A file bind mount holds the file, not its path: replacing the secret would leave a
+        running container on the old password, and compose sees no change in a secret's
+        content. So an existing secret is rewritten in place and nothing is recreated."""
+        self.assertEqual(self.run_launcher("up", "-d").returncode, 0)
+        inode = self.secret.stat().st_ino
+        self.write_config(password="Rotated-Password-10")
+        result = self.run_launcher("up", "-d")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.secret.read_text(), "Rotated-Password-10")
+        self.assertEqual(self.secret.stat().st_ino, inode)  # what the container has mounted
+        self.assertEqual(self.secret.stat().st_mode & 0o777, 0o600)
+        self.assertNotIn("--force-recreate", self.calls())  # no shutdown/startup power cycle
+        self.assertNotIn("Rotated-Password-10", result.stdout + result.stderr + self.calls())
+        self.write_config(password="Short-9")  # a shorter one leaves nothing of the longer
+        self.assertEqual(self.run_launcher("up", "-d").returncode, 0)
+        self.assertEqual(self.secret.read_text(), "Short-9")
+
+    def test_a_directory_docker_left_at_the_secret_path_is_replaced(self):
+        # Compose run without the launcher creates a directory for the missing bind source.
+        self.secret.mkdir(parents=True)
+        self.assertEqual(self.run_launcher("up", "-d").returncode, 0)
+        self.assertEqual(self.secret.read_text(), PASSWORD)
 
     def test_unfilled_rig_var_renders_but_never_starts(self):
         self.write_config(password="{{doodle_radio_password}}")

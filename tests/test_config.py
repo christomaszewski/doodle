@@ -86,6 +86,21 @@ class ConfigTests(unittest.TestCase):
             with self.assertRaisesRegex(ConfigError, "use_sim_time"):
                 dc.load(dict(base(), ros={"use_sim_time": value}))
 
+    def test_an_empty_limit_entry_means_no_bounds(self):
+        # `links.stations:` with its bounds commented out is YAML null. rig's overlay merge
+        # also treats null as "no value", so it must not mean anything else here.
+        for raw in ({"limits": {"links.stations": None}}, {"limits": None}):
+            limits = dc.health(raw)["limits"]
+            self.assertTrue(all(isinstance(bounds, dict) for bounds in limits.values()), raw)
+        config = dict(base(), health={"limits": {"links.stations": None}})
+        runtime = dc.runtime(json.loads(dc.runtime_json(dc.load(config))))
+        self.assertEqual(runtime["health"]["limits"], {"links.stations": {}})
+
+    def test_a_number_too_large_for_a_float_is_a_config_error(self):
+        for raw in ({"interval_s": 10 ** 400}, {"limits": {"rf.noise_dbm": {"warn_above": 10 ** 400}}}):
+            with self.assertRaises(ConfigError, msg=raw):
+                dc.health(raw)
+
     def test_identity_must_be_safe_tokens(self):
         for bad in ({"name": "Mesh"}, {"name": "mesh;x"}, {"service": "1doodle"},
                     {"ros": {"namespace": "a/b"}}):

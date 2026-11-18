@@ -26,17 +26,38 @@ except ImportError:  # pragma: no cover
 
 
 def write_secret(path: Path, password: str) -> None:
-    """Atomically replace `path` with the password, readable by its owner only."""
+    """Make `path` hold the password, readable by its owner only.
+
+    A new file is created atomically. An existing one is rewritten in place and never replaced:
+    a running container has that very file mounted (a bind mount holds the file, not its path),
+    and the supervisor reads it again at every login. So a rotated password reaches a running
+    service with the next `up`, without recreating the container, which would run the shutdown
+    and startup power changes just to change a password. A read that lands inside the rewrite
+    is one failed login, retried on the next pass."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}")
-    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    if path.is_dir() and not path.is_symlink():
+        path.rmdir()  # Docker creates a directory for a bind source that did not exist
     try:
-        with os.fdopen(descriptor, "w") as handle:
+        descriptor = os.open(path, os.O_RDWR | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        temporary = path.with_name(f".{path.name}.{os.getpid()}")
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            with os.fdopen(descriptor, "w") as handle:
+                handle.write(password)
+            os.replace(temporary, path)
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            raise
+        return
+    with os.fdopen(descriptor, "r+") as handle:
+        os.fchmod(handle.fileno(), 0o600)
+        if handle.read() != password:
+            handle.seek(0)
+            handle.truncate()
             handle.write(password)
-        os.replace(temporary, path)
-    except BaseException:
-        temporary.unlink(missing_ok=True)
-        raise
+            handle.flush()
+            os.fsync(handle.fileno())
 
 
 def main() -> int:
@@ -51,8 +72,17 @@ def main() -> int:
     try:
         with open(path) as handle:
             raw = yaml.safe_load(handle) or {}
-    except (OSError, yaml.YAMLError) as error:
-        sys.stderr.write(f"render_config: cannot read {path}: {error}\n")
+    except OSError as error:
+        sys.stderr.write(f"render_config: cannot read {path}: {error.strerror or error}\n")
+        return 2
+    except yaml.YAMLError as error:
+        # Never the parser's own message: for an unquoted password starting with ! or * it
+        # quotes the "tag" or "alias" it could not resolve, which is the password.
+        mark = getattr(error, "problem_mark", None)
+        where = f" at line {mark.line + 1}, column {mark.column + 1}" if mark else ""
+        sys.stderr.write(f"render_config: {path} is not valid YAML{where} (the text is not "
+                         "shown: it may be the password). Put text values in quotes, single "
+                         "quotes if they contain \\ or \".\n")
         return 2
     try:
         config = doodle_config.load(raw)

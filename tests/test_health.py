@@ -301,6 +301,46 @@ class HealthTests(unittest.TestCase):
         self.assertIn("link.signal_dbm -85 crossed warn_below -80", weak["message"])
         self.assertEqual(rows["link/00:30:1a:00:00:03"]["level"], OK)
 
+    def test_an_empty_limit_entry_does_not_silence_diagnostics(self):
+        self.reporter = HealthReporter("mesh", settings={"limits": {"links.stations": None}},
+                                       clock=self.clock)
+        self.controller.reconcile()
+        self.reporter.poll(self.api)
+        self.assertEqual(self.rows()["links"]["level"], OK)
+
+    def test_malformed_replies_never_cost_more_than_what_they_carry(self):
+        """Replies of the wrong shape or with absurd numbers blank their own measurements; they
+        must not raise past the pass (nothing recorded, nothing explaining the stale data)."""
+        real = self.radio._method
+        cases = {
+            "uci values is a list": lambda o, m, a: {"values": [1]} if (o, m) == ("uci", "get") else real(o, m, a),
+            "an integer too large for a float": lambda o, m, a: dict(real(o, m, a), memory={
+                "total": 10 ** 400, "free": 10 ** 400}) if (o, m) == ("system", "info") else real(o, m, a),
+            "a firmware version that is not text": lambda o, m, a: dict(real(o, m, a), release={
+                "version": ["x"]}) if (o, m) == ("system", "board") else real(o, m, a),
+            "a debugfs value thousands of digits long": lambda o, m, a: {"data": "9" * 5000} if (
+                (o, m) == ("file", "read") and "ath9k" in a.get("path", "")) else real(o, m, a),
+        }
+        self.controller.reconcile()
+        for name, method in cases.items():
+            with self.subTest(name):
+                self.radio._method = method
+                reporter = self.reporter = HealthReporter("mesh", "vehicle", clock=self.clock)
+                reporter.poll(RadioAPI("fake", "user", "fixture-password", transport=self.radio))
+                rows = self.rows()  # serializes strictly, as the ROS adapter does
+                self.assertEqual(set(reporter.samples), {"radio", "links", "system"}, name)
+                self.assertTrue(all(isinstance(row["message"], str) for row in rows.values()))
+        self.radio._method = real
+
+    def test_an_unexpected_error_in_a_pass_is_reported_not_only_logged(self):
+        self.reporter.poll(self.api)
+        with patch.object(self.reporter, "_radio", side_effect=KeyError("surprise")):
+            with self.assertRaises(KeyError):  # still raised: health_ros logs it with a traceback
+                self.reporter.poll(self.api)
+        errors = {name: row["values"].get("health.error") for name, row in self.rows().items()}
+        for group in ("radio", "links", "system"):
+            self.assertIn("KeyError", errors[group])
+
     def test_configured_limits_raise_the_level(self):
         self.reporter = HealthReporter("mesh", settings={"limits": {
             "links.stations": {"warn_below": 1}, "rf.noise_dbm": {"error_above": -95}}},
@@ -564,6 +604,23 @@ class ParameterTests(unittest.TestCase):
         self.assertEqual(self.bridge.set("off"), (True, ""))  # the follow-up write is a no-op
         self.assertEqual(self.bridge.set("standby"), (True, ""))  # back on from ROS is fine
         self.assertEqual((self.radio.rf_up, self.radio.txpower), (True, 19))
+
+    def test_startup_is_refused_when_it_would_switch_rf_off(self):
+        """`startup` is a second spelling of whatever tx_power.startup holds. When that is off,
+        it is the same remote switch-off that `off` is refused for."""
+        tests = HealthTests("test_a_healthy_radio")
+        tests.setUp()
+        self.addCleanup(tests.tmp.cleanup)
+        controller = tests.make_controller(startup="off")
+        controller.request("medium")  # RF on at a level (a launcher request)
+        bridge = ParameterBridge(controller)
+        for value in ("startup", " STARTUP "):
+            self.assertEqual(bridge.set(value), (False, OFF_REFUSED))
+        self.assertTrue(tests.radio.rf_up)
+        self.assertEqual(controller.target, "medium")
+        controller.request("startup")  # from the launcher it is allowed; RF goes off
+        self.assertFalse(tests.radio.rf_up)
+        self.assertEqual(bridge.set("startup"), (True, ""))  # already there: nothing to refuse
 
     def test_unreachable_radio_accepts_and_keeps_trying(self):
         self.radio.unreachable = True

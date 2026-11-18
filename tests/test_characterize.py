@@ -105,6 +105,39 @@ class SnapshotTests(unittest.TestCase):
         self.assertEqual(len(attempts), 1)
         self.assertEqual(snapshot["radios"]["vehicle"]["wireless"]["frequency"], 2450)
 
+    def test_a_link_that_drops_mid_poll_costs_one_more_request_not_one_per_read(self):
+        """The GCS radio answers the first reads, then the mesh link fades. Every further read
+        would wait out its own timeout (2 s each, per station file), holding back this radio's
+        own samples exactly when the link is degrading."""
+        gcs, attempts = PeerRadio(), []
+
+        def transport(payload, timeout=None):
+            attempts.append(payload["params"][1:3])
+            if len(attempts) > 3:  # login, RF state and `iwinfo info` answered; then nothing
+                gcs.unreachable = True
+            return gcs(payload, timeout)
+
+        apis = {"vehicle": RadioAPI("fake", "user", "fixture-password", transport=PeerRadio()),
+                "gcs": RadioAPI("fake", "user", "fixture-password", transport=transport)}
+        snapshot = characterize.Collector(apis, 1.0).poll()
+        view = snapshot["radios"]["gcs"]
+        self.assertEqual(len(attempts), 4)  # one request found the link gone; none after it
+        self.assertIn("unreachable", view["unreachable"])
+        self.assertEqual(view["wireless"]["frequency"], 2450)  # what was read is kept
+        self.assertNotIn("station_dump", view)
+        self.assertEqual(snapshot["radios"]["vehicle"]["peer_files"][PEER]["peer_signal"],
+                         PEER_FILES["peer_signal"].strip())
+        strict(json.dumps(snapshot))
+
+    def test_a_malformed_station_listing_skips_what_is_not_an_entry(self):
+        radio = PeerRadio()
+        real = radio._method
+        radio._method = lambda obj, method, args: (
+            {"entries": ["not-an-entry", {"name": PEER}]} if (obj, method) == ("file", "list")
+            else real(obj, method, args))
+        view = collector(vehicle=radio).poll()["radios"]["vehicle"]
+        self.assertEqual(list(view["peer_files"]), [PEER])  # the odd entry is skipped
+
     def test_a_failed_read_is_recorded_where_its_data_would_be(self):
         radio = FakeRadio()  # no station dump, no file list
         radio.unreadable.add(LINKSTATE)

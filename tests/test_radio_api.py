@@ -12,8 +12,8 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "docker/entrypoints"))
 sys.path.insert(0, str(ROOT / "tests"))
-from radio_api import AuthError, RadioAPI, RadioError, UbusError  # noqa: E402
-from fake_radio import FakeRadio, MESH_KEY, Server  # noqa: E402
+from radio_api import AuthError, RadioAPI, RadioError, ReplyError, UbusError  # noqa: E402
+from fake_radio import FakeRadio, Handler, MESH_KEY, Server  # noqa: E402
 
 
 def api(radio, password="fixture-password", **kwargs):
@@ -127,6 +127,43 @@ class TransportTests(unittest.TestCase):
             server.garbage_replies = 1
             self.assertIn("uptime", client.system_info())
             self.assertEqual(len(server.connections), 2)
+            client.close()
+
+    def test_a_password_provider_is_asked_at_every_login(self):
+        radio, current = FakeRadio(), ["fixture-password"]
+        client = RadioAPI("fake", "user", lambda: current[0], transport=radio)
+        client.system_info()
+        radio.password = "rotated"
+        radio.sessions.clear()
+        with self.assertRaises(AuthError):
+            client.system_info()
+        current[0] = "rotated"
+        self.assertIn("uptime", client.system_info())
+
+        def unreadable():
+            raise RuntimeError("cannot read the radio password at /run/secrets/x: gone")
+        broken = RadioAPI("fake", "user", unreadable, transport=radio)
+        with self.assertRaisesRegex(AuthError, "cannot read the radio password"):
+            broken.system_info()
+
+    def test_nan_in_a_reply_is_a_malformed_reply(self):
+        # Python's json accepts NaN and Infinity; nothing downstream (diagnostics values, the
+        # tx-power status JSON) may carry them.
+        class NanHandler(Handler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers["Content-Length"]))
+                data = b'{"jsonrpc": "2.0", "id": 1, "result": [0, {"txpower": NaN}]}'
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+        with Server(FakeRadio()) as server:
+            server.RequestHandlerClass = NanHandler
+            client = RadioAPI("127.0.0.1", "user", "fixture-password", scheme="http",
+                              port=server.server_address[1])
+            with self.assertRaisesRegex(ReplyError, "not JSON"):
+                client.system_info()
             client.close()
 
     def test_garbage_on_a_new_connection_is_an_error_not_a_retry(self):

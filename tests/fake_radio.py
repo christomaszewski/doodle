@@ -7,6 +7,7 @@ and replies that carry the mesh key. `iwinfo assoclist` follows the standard Ope
 the linkstate and per-station debugfs peer formats are synthetic (not yet observed on hardware).
 """
 import http.server
+import itertools
 import json
 import threading
 
@@ -212,6 +213,12 @@ class FakeRadio:
 class Handler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"  # keep-alive, like uhttpd
 
+    def setup(self):
+        super().setup()
+        # One number per accepted connection. id(self.connection) is not one: a closed socket's
+        # id is free for the next connection to reuse, so two could count as one.
+        self.connection_number = next(self.server.connection_numbers)
+
     def do_POST(self):
         if self.path != "/ubus":
             self.send_error(404)
@@ -225,7 +232,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(b"0\r\n\r\n")
             self.close_connection = True
             return
-        self.server.connections.add(id(self.connection))
+        self.server.connections.add(self.connection_number)
         data = json.dumps(self.server.radio.handle(json.loads(body))).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -246,7 +253,8 @@ class Server(http.server.ThreadingHTTPServer):
     def __init__(self, radio, address=("127.0.0.1", 0)):
         super().__init__(address, Handler)
         self.radio = radio
-        self.connections = set()
+        self.connections = set()  # numbers of the connections that were answered
+        self.connection_numbers = itertools.count(1)
         self.close_after_reply = False
         self.garbage_replies = 0  # next requests answered with a bare "0" instead of HTTP
 

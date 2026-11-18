@@ -88,6 +88,23 @@ class ServiceTests(unittest.TestCase):
         self.assertNotIn(self.radio.password, log)
         self.assertNotIn(MESH_KEY, log)
 
+    def test_a_rotated_password_is_picked_up_without_a_restart(self):
+        self.start(startup="medium")
+        secret = Path(self.env["DOODLE_SECRET_FILE"])
+        with self.radio.lock:  # the password is changed on the radio; its sessions end
+            self.radio.password = "Rotated-Password-10"
+            self.radio.sessions.clear()
+        rejected = json.loads(self.ctl("status").stdout)
+        self.assertIn("rejected the API login", rejected["error"])
+        with open(secret, "r+") as handle:  # what `doodle-up … up` does: same file, new content
+            handle.truncate()
+            handle.write("Rotated-Password-10")
+        status = json.loads(self.ctl("status").stdout)
+        self.assertEqual((status["error"], status["converged"], status["tx_power_dbm"]),
+                         ("", True, 27))
+        self.assertEqual(self.stop(), 0, self.output())
+        self.assertNotIn("Rotated-Password-10", self.output())
+
     def test_unconfirmed_shutdown_exits_nonzero(self):
         self.start(startup="unchanged", shutdown="off")
         self.radio.unreachable = True  # the radio disappears before shutdown

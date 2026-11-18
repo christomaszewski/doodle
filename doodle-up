@@ -108,7 +108,9 @@ if [ "${ARGS[0]}" = "tx-power" ]; then
 fi
 
 # --- creating a container: write the password secret from the config ----------------------------
-# The renderer writes the file itself, so the password never passes through this shell.
+# The renderer writes the file itself, so the password never passes through this shell. An
+# existing file is rewritten in place: a running container has it mounted and the supervisor
+# reads it at every login, so `up` after a password rotation needs no recreate.
 case "${ARGS[0]}" in
   up|create|run)
     "$PYTHON" "$REPO/tools/render_config.py" --write-secret "$SECRET_FILE" "$CONFIG_ABS"

@@ -165,7 +165,12 @@ def tx_power(raw):
 
 
 def _number(value, where):
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+    try:
+        finite = not isinstance(value, bool) and isinstance(value, (int, float)) \
+            and math.isfinite(value)
+    except OverflowError:  # an integer too large for a float
+        finite = False
+    if not finite:
         raise ConfigError(f"{where} must be a finite number")
     return value
 
@@ -179,13 +184,15 @@ def health(raw):
     for key in ("interval_s", "poll_interval_s", "stale_after_s"):
         if _number(result[key], f"health.{key}") <= 0:
             raise ConfigError(f"health.{key} must be positive")
-    limits = _mapping(result["limits"], "health.limits")
-    for metric, bounds in limits.items():
+    limits = {}
+    for metric, bounds in _mapping(result["limits"], "health.limits").items():
+        # An entry left empty (its bounds commented out) is YAML null: no bounds, not an error.
         bounds = _mapping(bounds, f"health.limits.{metric}")
         for bound, value in bounds.items():
             if bound not in LIMIT_BOUNDS:
                 raise ConfigError(f"invalid health.limits.{metric}.{bound}")
             _number(value, f"health.limits.{metric}.{bound}")
+        limits[metric] = bounds
     result["limits"] = limits
     peers = {}
     for mac, name in _mapping(result["peers"], "health.peers").items():

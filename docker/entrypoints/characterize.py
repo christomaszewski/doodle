@@ -6,7 +6,8 @@ and, when `characterization.gcs` names it, the GCS radio over the mesh, every
 snapshot as JSON on /<namespace>/radio/characterization, beside /diagnostics in the bag.
 
 Only reads: nothing here writes to either radio. A failed read is recorded where its data would
-have been, never left out, and a radio that cannot be reached costs one bounded request per poll.
+have been, never left out, and a radio that cannot be reached costs one bounded request per poll:
+one that stops answering part-way keeps what was read, and the reads left are skipped.
 The GCS radio is reached with this radio's API password.
 
 Per radio: RF state; `iwinfo info` (frequency, channel, TX power, noise); the link report without
@@ -89,15 +90,20 @@ def read(radio):
     def attempt(name, action):
         try:
             found[name] = action()
-        except RadioError as error:
+        except ReplyError as error:  # the radio answered: only this read is missing
             found[name] = {"error": str(error)}
 
-    attempt("wireless", radio.wireless)
-    wireless = found["wireless"] if "error" not in found["wireless"] else {}
-    attempt("linkstate", lambda: link_report(radio))
-    attempt("survey", lambda: radio.survey(required(wireless, "frequency")))
-    attempt("station_dump", lambda: station_dump(radio))
-    attempt("peer_files", lambda: peer_files(radio, required(wireless, "phy")))
+    try:
+        attempt("wireless", radio.wireless)
+        wireless = found["wireless"] if "error" not in found["wireless"] else {}
+        attempt("linkstate", lambda: link_report(radio))
+        attempt("survey", lambda: radio.survey(required(wireless, "frequency")))
+        attempt("station_dump", lambda: station_dump(radio))
+        attempt("peer_files", lambda: peer_files(radio, required(wireless, "phy")))
+    except RadioError as error:
+        # The radio stopped answering mid-poll (the link faded): every read left would wait out
+        # its own timeout and hold back the other radio's samples. Keep what was read.
+        found["unreachable"] = str(error)
     return found
 
 
@@ -127,14 +133,15 @@ def station_dump(radio):
 def peer_files(radio, phy):
     stations = STATIONS.format(phy=phy, device=radio.device)
     found = {}
-    for station in radio.call("file", "list", {"path": stations}).get("entries") or []:
-        name = station.get("name")
+    entries = radio.call("file", "list", {"path": stations}).get("entries")
+    for station in entries if isinstance(entries, list) else []:
+        name = station.get("name") if isinstance(station, dict) else None
         if not isinstance(name, str) or "/" in name:
             continue
         found[name] = {}
         for item in PEER_FILES:
             try:
                 found[name][item] = radio.read_text(f"{stations}/{name}/{item}").strip()
-            except RadioError as error:
+            except ReplyError as error:  # an outage is not caught here: read() ends the pass
                 found[name][item] = {"error": str(error)}
     return found

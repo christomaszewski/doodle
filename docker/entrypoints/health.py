@@ -35,6 +35,8 @@ STATION_DEBUGFS = "/sys/kernel/debug/ieee80211/{phy}/netdev:{device}/stations/{m
 STATION_FILES = ("fixed_txpower", "peer_signal_reply")
 STATION_MISSING_PASSES = 3                 # passes of "no such file" for every peer = unsupported
 PHY = re.compile(r"^phy[0-9]+$")
+INTEGER = r"-?\d{1,9}"                     # a debugfs value; longer is not one (and int() of
+#                                            thousands of digits raises)
 MAC = re.compile(r"^[0-9a-f]{2}(:[0-9a-f]{2}){5}$")
 # Field names that usually carry a peer's address. Otherwise an entry's only MAC-shaped value is
 # used; an entry with several (a mesh route also names its next hop) is not guessed at.
@@ -61,7 +63,12 @@ SETTINGS = (("distance", "rf.distance_m"), ("txpower", "rf.saved_tx_power_dbm"),
 
 
 def numeric(value):
-    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:  # an integer too large for a float is not a measurement
+        return False
 
 
 def status(component, level=OK, message="OK", values=None):
@@ -256,7 +263,19 @@ class HealthReporter:
 
     def poll(self, radio):
         """One read-only pass. A per-call failure (permission, missing file, malformed reply)
-        only blanks what that call provides; an outage or rejected login fails the whole pass."""
+        only blanks what that call provides; an outage or rejected login fails the whole pass.
+        An error this code did not expect (a reply shape it does not handle) fails every group
+        with its name, so /diagnostics says why the data is going stale, and is raised on for
+        the caller to log."""
+        try:
+            self._poll(radio)
+        except Exception as error:
+            for group in GROUPS:
+                self.fail(group, f"internal error reading the radio: {type(error).__name__}: "
+                                 f"{str(error)[:MAX_TEXT]}")
+            raise
+
+    def _poll(self, radio):
         errors = {}
 
         def attempt(what, call):
@@ -412,7 +431,7 @@ class HealthReporter:
 
     @staticmethod
     def _station_value(name, text):
-        if name == "fixed_txpower" and re.fullmatch(r"-?\d+", text):
+        if name == "fixed_txpower" and re.fullmatch(INTEGER, text):
             limit = int(text)
             if limit == NO_OVERRIDE:
                 return {"link.apc_limited": False}
@@ -485,7 +504,7 @@ class HealthReporter:
         except ReplyError as error:
             errors[name] = error
             return None
-        if not re.fullmatch(r"-?\d+", text):
+        if not re.fullmatch(INTEGER, text):
             # rpcd reads nothing from a file that reports size 0 on some builds: not readable here
             self.capability_state[name] = "unsupported"
             return None

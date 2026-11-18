@@ -35,7 +35,11 @@ RECONCILE_INTERVAL = 5
 LOCK_WAIT = 20          # a request queued behind another change fails after this long
 RF_TIMEOUT = 90         # RF on (observed: < 40 s) or off
 APPLY_TIMEOUT = 10      # power read-back after `iw set txpower`
-SHUTDOWN_BUDGET = 45    # inside compose's 60 s stop grace period
+# Compose stops the container with SIGTERM and kills it 60 s later (stop_grace_period). Inside
+# that: this one budget for taking over from a change in progress and applying
+# tx_power.shutdown, then health_ros.TEARDOWN_BUDGET for stopping ROS. A final observation can
+# overrun this budget by one request timeout.
+SHUTDOWN_BUDGET = 40
 HEALTH_TIMEOUT = 2.0    # per diagnostics request
 
 
@@ -57,6 +61,7 @@ class Controller:
         self.reachable = False
         self._permissions_checked = False
         self._supported = (None, [])  # (frequency, txpowerlist) — re-read when the channel moves
+        self._range = []  # the txpowerlist last seen with RF on, kept while RF is off
         self.target = self._load_target()
         self.snapshot = self._snapshot(self.target, None, "", "waiting for first observation")
 
@@ -98,6 +103,7 @@ class Controller:
                 LOG.warning("radio rebooted (uptime %ss -> %ss); its saved settings are back",
                             self.uptime, uptime)
                 self._supported = (None, [])
+                self._range = []
             self.uptime = uptime
         observation = {"rf": "off", "tx_power_dbm": None, "supported": []}
         if self.radio.rf_up():
@@ -105,6 +111,7 @@ class Controller:
             frequency = wireless.get("frequency")
             if self._supported[0] != frequency or not self._supported[1]:
                 self._supported = (frequency, self.radio.txpower_list())
+            self._range = self._supported[1] or self._range
             observation.update(rf="on", tx_power_dbm=wireless.get("txpower"),
                                supported=self._supported[1])
         else:
@@ -198,14 +205,16 @@ class Controller:
                 raise RadioError(f"radio did not reach {what} (last seen: {last})")
             self._pause(self.poll, stop_aware)
 
-    def apply(self, target, *, deadline, stop_aware=True):
-        """Bring the radio to `target`; read everything back. Writes only what differs."""
+    def apply(self, target, *, deadline, stop_aware=True, check_first=False):
+        """Bring the radio to `target`; read everything back. Writes only what differs.
+        `check_first` (operator requests): with RF off, a target outside the range last seen
+        with RF on is refused before RF is turned on for it."""
         try:
-            return self._apply(target, deadline, stop_aware)
+            return self._apply(target, deadline, stop_aware, check_first)
         finally:
             self.changing = ""
 
-    def _apply(self, target, deadline, stop_aware):
+    def _apply(self, target, deadline, stop_aware, check_first=False):
         observation = self.observe()
         if target == "unchanged":
             return observation
@@ -219,6 +228,8 @@ class Controller:
                                              stop_aware)
             return observation
         if observation["rf"] == "off":
+            if check_first and self._range:
+                self.resolve(target, self._range)  # PowerError here: nothing was written
             self.radio.require("rf_toggle")
             LOG.info("turning RF on")
             self.changing = "turning RF on"
@@ -271,8 +282,10 @@ class Controller:
             self.target = target
             self._save_target(None if value == "startup" else target)
             LOG.info("request: %s", power.describe(target))
+            # One deadline for the change and, if it is refused, the way back.
+            deadline = self.clock() + self.rf_timeout
             try:
-                observation = self.apply(target, deadline=self.clock() + self.rf_timeout)
+                observation = self.apply(target, deadline=deadline, check_first=True)
             except power.PowerError as error:
                 # The radio cannot honor it: reject instead of persisting an impossible target.
                 self.target = previous
@@ -280,11 +293,17 @@ class Controller:
                     self.target_file.unlink(missing_ok=True)
                 else:
                     self.target_file.write_text(saved)
-                self._record(None, "")
+                # Without a known range RF had to come up before the value could be checked
+                # (a supervisor that started with RF off). Return to the previous target now,
+                # not at the next reconcile pass: with a target of off the radio is transmitting.
+                try:
+                    self._record(self.apply(previous, deadline=deadline))
+                except (RadioError, power.PowerError) as failed:
+                    self._record(None, failed)  # the reconcile loop keeps trying
                 raise RuntimeError(str(error)) from None
             except RadioError as error:
                 # Accepted but not (yet) applied: the target stays; reconcile keeps trying.
-                self._record(None, str(error))
+                self._record(None, error)
                 raise
             return self._record(observation)
         finally:
@@ -295,7 +314,8 @@ class Controller:
         policy = self.settings["shutdown"]
         self.stop_event.set()
         started = self.clock()
-        if not self.lock.acquire(timeout=LOCK_WAIT):
+        deadline = started + SHUTDOWN_BUDGET  # for the wait below and the change together
+        if not self.lock.acquire(timeout=min(LOCK_WAIT, SHUTDOWN_BUDGET)):
             raise RuntimeError("shutdown could not take control of the radio; power unconfirmed")
         try:
             if policy == "unchanged":
@@ -303,8 +323,7 @@ class Controller:
                 return
             LOG.info("shutdown: applying %s", power.describe(policy))
             # Runs despite stop_event: this is the one change that must finish.
-            observation = self.apply(policy, deadline=self.clock() + SHUTDOWN_BUDGET,
-                                     stop_aware=False)
+            observation = self.apply(policy, deadline=deadline, stop_aware=False)
             LOG.info("shutdown complete: RF %s, %s dBm (restart target stays %s)",
                      observation["rf"], observation["tx_power_dbm"], power.describe(self.target))
         except Exception:
@@ -372,7 +391,13 @@ def serve(*, monitor=health_monitor):
     signal.signal(signal.SIGINT, lambda *_: stop_event.set())
     config = doodle_config.runtime(json.loads(os.environ.get("DOODLE_CONFIG") or "{}"))
     connection = config["connection"]
-    password = read_password(SECRET_FILE)
+    read_password(SECRET_FILE)  # fail at start, with one clear message, if it is missing
+
+    def password():
+        """Read at every login: the launcher rewrites the mounted file when the password is
+        rotated, and the next login (the session expired, or the radio dropped it) uses it."""
+        return read_password(SECRET_FILE)
+
     radio = RadioAPI.from_config(connection, password)
     # Diagnostics read with their own session and short timeouts, so they never wait on a change.
     health_radio = RadioAPI.from_config(connection, password, timeout=HEALTH_TIMEOUT)
@@ -469,7 +494,7 @@ def main(argv=None):
             healthy = status.get("converged") and not status.get("error")
             return 0 if healthy and not str(status.get("diagnostics")).startswith("failed") else 1
         else:
-            sys.stderr.write("usage: supervisor.py serve | status | set <value> | health\n")
+            sys.stderr.write("usage: supervisor.py serve | status | ready | set <value> | health\n")
             return 2
         return 0
     except Exception as error:
