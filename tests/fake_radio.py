@@ -3,7 +3,8 @@
 Reply shapes follow docs/RADIO_API.md (firmware 2026-03.1); every value is synthetic. The model
 reproduces the behaviors the service depends on: the 19-32 dBm range with silent clamping,
 `auto`/RF-on returning to the maximum, RF off removing the interface, session expiry, reboots,
-and replies that carry the mesh key.
+and replies that carry the mesh key. `iwinfo assoclist` follows the standard OpenWrt rpcd reply;
+the linkstate and per-station debugfs peer formats are synthetic (not yet observed on hardware).
 """
 import http.server
 import json
@@ -40,6 +41,15 @@ class FakeRadio:
         self.debugfs = {"txpower_selfgen": "255\n", "txpower_mcast": "255\n"}
         self.sta_stats, self.mesh_stats = [], []  # linkstate peer entries (format synthetic)
         self.noise = -94.0               # linkstate noise floor; None = not in the report
+        self.driver_noise = -94          # `iwinfo info` noise; 0 = the driver has none
+        # The radio rewrites the link report every 2 s; each read here is a new rewrite unless
+        # the linkstate service is "stopped" (the report then keeps its last contents).
+        self.linkstate_time = 1700000000
+        self.linkstate_stopped = False
+        # `iwinfo assoclist` entries: the kernel's station table (rates in kbit/s)
+        self.stations = []
+        # Per-station debugfs files: {mac (as the kernel names it): {file name: text}}
+        self.station_files = {}
         # `iwinfo survey` counters (ms) for the current channel; each read adds `survey_step`
         self.survey = {"active_time": 30000, "busy_time": 250, "rx_time": 150, "tx_time": 15}
         self.survey_step = {"active_time": 5000, "busy_time": 40, "rx_time": 25, "tx_time": 2}
@@ -138,8 +148,11 @@ class FakeRadio:
             if method == "info":
                 return {"phy": "phy0", "ssid": "example-mesh", "bssid": "00:30:1A:12:34:56",
                         "country": "US", "mode": "Mesh Point", "channel": self.channel,
-                        "frequency": self.frequency, "txpower": self.txpower, "noise": -94,
+                        "frequency": self.frequency, "txpower": self.txpower,
+                        "noise": self.driver_noise,
                         "htmode": "HT20"}
+            if method == "assoclist":
+                return {"results": self.stations}
             if method == "txpowerlist":
                 return {"results": [{"dbm": d, "mw": round(10 ** (d / 10)),
                                      "active": d == self.txpower} for d in self.supported]}
@@ -153,7 +166,8 @@ class FakeRadio:
         if (obj, method) == ("uci", "get"):
             if args == {"config": "wireless", "section": "radio0"}:
                 return {"values": {".type": "wifi-device", ".name": "radio0", "chanbw": "20",
-                                   "channel": str(self.channel),
+                                   "channel": str(self.channel), "country": "US",
+                                   "distance": "1000", "txpower": "30", "htmode": "HT20",
                                    "dynamic_txpower": self.dynamic_txpower,
                                    "dynamic_txpower_aggr": "0"}}
             return [NOT_FOUND]
@@ -173,14 +187,21 @@ class FakeRadio:
             if path in self.unreadable:
                 return [NOT_FOUND]
             if path == "/tmp/linkstate_current.json":
+                if not self.linkstate_stopped:
+                    self.linkstate_time += 2
                 return {"data": json.dumps({
                     "sysinfo": {"cpu_load": [20000, 18000, 19000], "freemem": 12000000,
-                                "localtime": 1700000000},
+                                "localtime": self.linkstate_time},
                     "oper_chan": self.channel, "oper_freq": self.frequency, "chan_width": "20",
                     **({} if self.noise is None else {"noise": self.noise}),
                     "noise_peak": -92.0, "activity": 1, "lna_status": "1",
                     "sta_count": len(self.sta_stats), "sta_stats": self.sta_stats,
                     "mesh_count": len(self.mesh_stats), "mesh_stats": self.mesh_stats})}
+            stations = "/sys/kernel/debug/ieee80211/phy0/netdev:wlan0/stations/"
+            if self.rf_up and path.startswith(stations):
+                mac, _, name = path[len(stations):].partition("/")
+                files = self.station_files.get(mac, {})
+                return {"data": files[name]} if name in files else [NOT_FOUND]
             prefix = "/sys/kernel/debug/ieee80211/phy0/ath9k/"
             if self.rf_up and path.startswith(prefix) and path[len(prefix):] in self.debugfs:
                 return {"data": self.debugfs[path[len(prefix):]]}

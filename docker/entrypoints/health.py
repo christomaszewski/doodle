@@ -7,9 +7,12 @@ Two sources, never mixed:
 - `radio`, `links`, `link/<mac>`, `mesh/<mac>`, `system` and `temperature` come from `poll`, a
   read-only pass over the radio API that runs on its own thread and API session.
 
-Failed reads keep the last observation, marked `retrying` and later STALE; a missing measurement
-is published as null with a metric state, never as zero. See docs/PLAN.md for the metric keys.
+Each group is stamped when its own reads returned, not when the whole pass ended. Failed reads keep
+the last observation, marked `retrying` and later STALE; a missing measurement is published as null
+with a metric state, never as zero. A link report the radio has stopped rewriting is not presented
+as new. See docs/PLAN.md for the metric keys.
 """
+import hashlib
 import json
 import math
 import re
@@ -26,9 +29,15 @@ SERVICE = "doodle"
 GROUPS = ("radio", "links", "system")      # what one poll observes
 NO_OVERRIDE = 255                          # ath9k_tpcd: ACK/broadcast power follows the level
 DEBUGFS = "/sys/kernel/debug/ieee80211/{phy}/ath9k/{name}"
+# Per-station files of ath9k_tpcd (docs/RADIO_API.md): how the peer hears us (and the power we
+# used), and the per-peer power limit automatic power control set (255 = none).
+STATION_DEBUGFS = "/sys/kernel/debug/ieee80211/{phy}/netdev:{device}/stations/{mac}/{name}"
+STATION_FILES = ("fixed_txpower", "peer_signal_reply")
+STATION_MISSING_PASSES = 3                 # passes of "no such file" for every peer = unsupported
 PHY = re.compile(r"^phy[0-9]+$")
 MAC = re.compile(r"^[0-9a-f]{2}(:[0-9a-f]{2}){5}$")
-# Field names that usually carry a peer's address; any MAC-shaped value is the fallback.
+# Field names that usually carry a peer's address. Otherwise an entry's only MAC-shaped value is
+# used; an entry with several (a mesh route also names its next hop) is not guessed at.
 MAC_FIELDS = ("mac", "macaddr", "mac_addr", "addr", "address", "orig_address", "originator",
               "station", "sta")
 # Vendor fields behind the vendor-neutral link quality keys (SERVICE_HEALTH.md Revision 3). The
@@ -39,8 +48,16 @@ SIGNAL_FIELDS = ("signal_dbm", "rssi_dbm", "rssi", "signal")
 SNR_FIELDS = ("snr_db", "snr")
 LOSS_FIELDS = ("loss_pct", "pl_ratio")     # pl_ratio is a percentage: the radio alerts above 60
 MAX_LOST_PEERS = 32                        # departed peers remembered (oldest dropped first)
-MAX_TEXT = 256                             # longest string value copied from a peer entry
+MAX_TEXT = 2048                            # longest string or nested JSON copied from a peer
 MIN_AIRTIME_WINDOW_MS = 1000               # shortest counter window worth a percentage
+# The radio rewrites its link report every 2 s (linkstate.linkstate.interval); a report unchanged
+# for this long means the radio's linkstate service has stopped, so its contents are not current.
+LINKSTATE_STALE_S = 6
+UNSUPPORTED = (3, 8)                       # ubus: method not found, not supported
+# wifi-device settings published as radio settings: (UCI option, key)
+SETTINGS = (("distance", "rf.distance_m"), ("txpower", "rf.saved_tx_power_dbm"),
+            ("antenna_gain", "rf.antenna_gain_dbi"), ("txantenna", "rf.tx_antennas"),
+            ("rxantenna", "rf.rx_antennas"))
 
 
 def numeric(value):
@@ -72,21 +89,56 @@ def _key(prefix, name):
     return prefix + re.sub(r"[^a-z0-9_]+", "_", str(name).lower()).strip("_")
 
 
+def _text(values, key, value):
+    """A string value, cut at MAX_TEXT and flagged when it was cut."""
+    values[key] = value[:MAX_TEXT]
+    if len(value) > MAX_TEXT:
+        values[f"{key}_truncated"] = True
+
+
 def _peer_values(prefix, entry):
     """Every field of one linkstate peer entry, as flat values. The per-peer format has not been
-    observed on hardware yet (docs/RADIO_API.md), so nothing here depends on field names."""
+    observed on hardware yet (docs/RADIO_API.md), so nothing here depends on field names. Nested
+    values become JSON text, or are left out and flagged `<key>_truncated` when too long: never a
+    cut-off, unparseable JSON string."""
     values = {}
-    for name, value in sorted(entry.items()):
+    for name, value in sorted(entry.items(), key=lambda item: str(item[0])):
         key = _key(prefix, name)
         if key == prefix or value is None:
             continue
         if isinstance(value, bool) or numeric(value):
             values[key] = value
         elif isinstance(value, str):
-            values[key] = value[:MAX_TEXT]
+            _text(values, key, value)
         elif isinstance(value, (list, dict)):
-            values[key] = json.dumps(value, sort_keys=True, allow_nan=False, default=str)[:MAX_TEXT]
+            try:
+                text = json.dumps(value, sort_keys=True, allow_nan=False, default=str)
+            except (TypeError, ValueError):  # NaN/Infinity inside: not strict JSON
+                text = None
+            if text is None or len(text) > MAX_TEXT:
+                values[f"{key}_truncated"] = True
+            else:
+                values[key] = text
     return values
+
+
+def _station_table_values(entry):
+    """One `iwinfo assoclist` station as flat `link.iw_*` values (the rx/tx rate tables flattened,
+    e.g. `link.iw_tx_rate` in kbit/s, `link.iw_tx_retries`)."""
+    values = {}
+    for name, value in entry.items():
+        if name == "mac":
+            continue
+        if name in ("rx", "tx") and isinstance(value, dict):
+            items = [(_key(f"link.iw_{name}_", sub), item) for sub, item in value.items()]
+        else:
+            items = [(_key("link.iw_", name), value)]
+        for key, item in items:
+            if isinstance(item, bool) or numeric(item):
+                values[key] = item
+            elif isinstance(item, str):
+                _text(values, key, item)
+    return dict(sorted(values.items()))
 
 
 def _measure(entry, names, low, high):
@@ -95,6 +147,11 @@ def _measure(entry, names, low, high):
         if value is not None and low <= value <= high:
             return value
     return None
+
+
+def _dbm(value):
+    """A dBm reading from the station table; iwinfo reports 0 when it has none."""
+    return value if numeric(value) and -130 <= value < 0 else None
 
 
 def link_quality(kind, entry, noise_dbm=None):
@@ -117,23 +174,54 @@ def link_quality(kind, entry, noise_dbm=None):
     return values
 
 
+def station_quality(entry, noise_dbm=None):
+    """Vendor-neutral keys from one `iwinfo assoclist` station: signal (the kernel's average, else
+    the last frame's), SNR against the station's noise reading or the radio's noise floor, and the
+    current transmit PHY rate (kbit/s in the table)."""
+    values = {}
+    signal = _dbm(entry.get("signal_avg")) or _dbm(entry.get("signal"))
+    noise = _dbm(entry.get("noise")) or (noise_dbm if numeric(noise_dbm) else None)
+    if signal is not None:
+        values["link.signal_dbm"] = signal
+        if noise is not None:
+            values["link.snr_db"] = round(signal - noise, 1)
+    tx = entry.get("tx") if isinstance(entry.get("tx"), dict) else {}
+    if numeric(tx.get("rate")) and 0 < tx["rate"] <= 10_000_000:
+        values["link.rate_mbps"] = round(tx["rate"] / 1000, 1)
+    return values
+
+
 def peer_address(entry):
     if not isinstance(entry, dict):
         return None
-    candidates = [entry.get(name) for name in MAC_FIELDS] + list(entry.values())
-    for value in candidates:
+    for name in MAC_FIELDS:
+        value = entry.get(name)
         if isinstance(value, str) and MAC.match(value.strip().lower()):
             return value.strip().lower()
-    return None
+    found = {value.strip().lower() for value in entry.values()
+             if isinstance(value, str) and MAC.match(value.strip().lower())}
+    return found.pop() if len(found) == 1 else None
+
+
+def _report_version(linkstate):
+    """What identifies one rewrite of the link report: the radio's clock at the rewrite (wrong as
+    a wall time, but it advances), else the report's content."""
+    sysinfo = linkstate.get("sysinfo") if isinstance(linkstate.get("sysinfo"), dict) else {}
+    if numeric(sysinfo.get("localtime")):
+        return ("localtime", sysinfo["localtime"])
+    text = json.dumps(linkstate, sort_keys=True, default=str)
+    return ("content", hashlib.sha256(text.encode()).hexdigest())
 
 
 class HealthReporter:
     def __init__(self, instance, vehicle="", settings=None, *, clock=time.monotonic):
         self.instance, self.vehicle = instance, vehicle
         self.settings = doodle_config.health(settings)
+        self.names = self.settings["peers"]  # MAC -> operator's name for that peer
         self.clock = clock
         self.publisher_id = str(uuid.uuid4())
         self.sequence = 0
+        self.revision = 0        # increments with every recorded group (a new observation)
         self.samples = {}        # group -> (monotonic time, sample id, [reports])
         self.failures = {}       # group -> why the latest attempt failed
         self.peers = {}          # (kind, mac) -> {"seen": monotonic, "values": {...}}
@@ -141,16 +229,20 @@ class HealthReporter:
         self.uptime = None
         self.hardware_id = ""
         self.capability_state = {}  # read -> "unsupported" once the API cannot provide it
-        self.survey_previous = None  # (frequency, airtime counters) from the previous poll
+        self.survey_previous = None  # (frequency, airtime counters, monotonic time) baseline
+        self.report_version = None   # identity of the latest link report seen
+        self.report_changed_at = None  # monotonic time it last changed
+        self.station_missing = {}    # station file -> consecutive passes it was missing for all
         self.started = clock()
         self.lock = threading.RLock()
 
     # --- collection (health thread) -------------------------------------------------------------
 
-    def record(self, group, reports):
+    def record(self, group, reports, at=None):
         with self.lock:
-            self.samples[group] = (self.clock(), str(uuid.uuid4()), reports)
+            self.samples[group] = (self.clock() if at is None else at, str(uuid.uuid4()), reports)
             self.failures.pop(group, None)
+            self.revision += 1
 
     def fail(self, group, error):
         with self.lock:
@@ -176,6 +268,7 @@ class HealthReporter:
 
         try:
             system = attempt("system", radio.system_info)
+            system_at = self.clock()
             uptime = (system or {}).get("uptime")
             rebooted = numeric(uptime) and numeric(self.uptime) and uptime < self.uptime
             if self.board is None or rebooted:
@@ -184,45 +277,155 @@ class HealthReporter:
                     self.identify(board)
             if rebooted:
                 self.capability_state.clear()  # a firmware change may change what is readable
+                self.station_missing.clear()
             if numeric(uptime):
                 self.uptime = uptime
             rf_up = attempt("rf", radio.rf_up)
             wireless = attempt("wireless", radio.wireless) if rf_up else None
+            radio_at = self.clock()
             control = attempt("power control", radio.power_control)
             linkstate = attempt("linkstate", lambda: radio.read_json(LINKSTATE))
             if linkstate is not None and not isinstance(linkstate, dict):
                 errors["linkstate"] = ReplyError(f"{LINKSTATE} is not a JSON object")
                 linkstate = None
+            stations = self._read_station_table(radio, errors) if rf_up else None
+            links_at = self.clock()
             overrides = {}
             phy = (wireless or {}).get("phy")
-            if rf_up and isinstance(phy, str) and PHY.match(phy):
+            phy = phy if rf_up and isinstance(phy, str) and PHY.match(phy) else None
+            if phy:
                 for name in ("txpower_selfgen", "txpower_mcast"):
                     overrides[name] = self._read_override(radio, phy, name, errors)
-            survey = None
+            survey = survey_at = None
             frequency = (wireless or {}).get("frequency")
             if rf_up and numeric(frequency) and "survey" not in self.capability_state:
                 survey = self._read_survey(radio, frequency, errors)
+                survey_at = self.clock()
+            station_files = {}
+            if phy:
+                station_files = self._read_station_files(
+                    radio, phy, self._station_order(linkstate, stations))
         except RadioError as error:  # unreachable, login rejected: nothing in this pass is current
             for group in GROUPS:
                 self.fail(group, error)
             return
 
+        new_report, report_age = False, None
+        if linkstate is not None:
+            version = _report_version(linkstate)
+            if version != self.report_version:
+                self.report_version, self.report_changed_at = version, links_at
+                new_report = True
+            report_age = round(links_at - self.report_changed_at, 1)
+            if report_age > LINKSTATE_STALE_S:
+                errors["linkstate"] = ReplyError(
+                    f"{LINKSTATE} not updated for {report_age:g} s (the radio's linkstate "
+                    "service may have stopped)")
+                linkstate = None
+
+        noise = self._noise_floor(linkstate, wireless)
         self.record("radio", [self._radio(rf_up, wireless, control, linkstate, overrides, survey,
-                                          errors)])
-        if linkstate is None:
-            self.fail("links", errors.get("linkstate", "no link report"))
-        else:
-            self.record("links", self._links(linkstate))
+                                          survey_at, noise, errors)], at=radio_at)
+        if linkstate is None and stations is None:
+            self.fail("links", errors.get("linkstate") or errors.get("station table")
+                      or "no link report")
+        elif new_report or stations is not None:
+            problems = [str(errors[what]) for what in ("linkstate", "station table")
+                        if what in errors]
+            self.record("links", self._links(links_at, linkstate, stations, station_files, noise,
+                                             report_age, problems), at=links_at)
+        # Otherwise the same link report as last time and no station table: nothing new.
         if system is None:
             self.fail("system", errors.get("system", "no system information"))
         else:
-            self.record("system", self._system(system))
+            self.record("system", self._system(system), at=system_at)
+
+    @staticmethod
+    def _noise_floor(linkstate, wireless):
+        """The link report's noise floor, else the driver's own reading (0 there means none)."""
+        noise = _round((linkstate or {}).get("noise"), digits=1)
+        if noise is None:
+            noise = _dbm((wireless or {}).get("noise"))
+        return noise
+
+    def _read_station_table(self, radio, errors):
+        if self.capability_state.get("assoclist") == "unsupported":
+            return None
+        try:
+            return radio.assoclist()
+        except UbusError as error:
+            if error.status in UNSUPPORTED:
+                self.capability_state["assoclist"] = "unsupported"
+                return None
+            errors["station table"] = error
+        except ReplyError as error:
+            errors["station table"] = error
+        return None
+
+    def _station_order(self, linkstate, stations):
+        """Present stations whose per-peer files to read: named peers first, then by address."""
+        macs = set()
+        if stations is not None:
+            macs.update(filter(None, map(peer_address, stations)))
+        elif linkstate is not None and isinstance(linkstate.get("sta_stats"), list):
+            macs.update(filter(None, map(peer_address, linkstate["sta_stats"])))
+        named = [mac for mac in self.names if mac in macs]
+        return (named + sorted(macs - set(named)))[:self.settings["reverse_link_peers"]]
+
+    def _read_station_files(self, radio, phy, macs):
+        """Per-peer automatic power control files, raw until their format is observed. A file
+        missing for every peer in several passes in a row is not provided by this radio."""
+        results = {}
+        names = [n for n in STATION_FILES if self.capability_state.get(f"station {n}") is None]
+        if not macs or not names:
+            return results
+        missing = dict.fromkeys(names, 0)
+        for mac in macs:
+            values = results.setdefault(mac, {})
+            for name in names:
+                path = STATION_DEBUGFS.format(phy=phy, device=radio.device, mac=mac, name=name)
+                try:
+                    text = radio.read_text(path).strip()
+                except UbusError as error:
+                    if error.status == 4:  # no such file (or the peer left mid-pass)
+                        missing[name] += 1
+                        continue
+                    values.update({f"link.{name}": None,
+                                   f"health.metric.link.{name}.state": "unavailable"})
+                    continue
+                except ReplyError:
+                    values.update({f"link.{name}": None,
+                                   f"health.metric.link.{name}.state": "unavailable"})
+                    continue
+                if not text:  # rpcd read nothing (debugfs reports size 0 on some builds)
+                    missing[name] += 1
+                    continue
+                values.update(self._station_value(name, text))
+        for name in names:
+            if missing[name] == len(macs):
+                self.station_missing[name] = self.station_missing.get(name, 0) + 1
+                if self.station_missing[name] >= STATION_MISSING_PASSES:
+                    self.capability_state[f"station {name}"] = "unsupported"
+            else:
+                self.station_missing[name] = 0
+        return results
+
+    @staticmethod
+    def _station_value(name, text):
+        if name == "fixed_txpower" and re.fullmatch(r"-?\d+", text):
+            limit = int(text)
+            if limit == NO_OVERRIDE:
+                return {"link.apc_limited": False}
+            return {"link.apc_limited": True, "link.apc_limit_dbm": limit}
+        values = {}
+        _text(values, f"link.{name}", text)
+        return values
 
     def _read_survey(self, radio, frequency, errors):
         try:
             return radio.survey(frequency)
         except UbusError as error:
-            if error.status in (3, 8):  # no `iwinfo survey` on this firmware
+            if error.status in UNSUPPORTED:  # no `iwinfo survey` on this firmware
                 self.capability_state["survey"] = "unsupported"
                 return None
             errors["survey"] = error
@@ -230,25 +433,42 @@ class HealthReporter:
             errors["survey"] = error
         return None
 
-    def _airtime(self, frequency, counters):
-        """Percent of the channel's active time spent transmitting and receiving, from the
-        counter change since the previous poll. When the counters restart (other readers,
-        channel changes), the current counters alone cover the time since the restart."""
+    def _airtime(self, frequency, counters, at):
+        """Percent of the channel's active time spent transmitting, receiving and sensing it busy,
+        over the counter change since the baseline. The first reading only sets the baseline; a
+        change shorter than MIN_AIRTIME_WINDOW_MS keeps it and waits for a longer window. When
+        the counters restart (other readers, channel changes), the new counters alone are used
+        only if they cover no more than the time since the previous reading."""
         keys = ("active_time", "rx_time", "tx_time")
-        previous, self.survey_previous = self.survey_previous, (frequency, counters)
         if not counters or not all(numeric(counters.get(k)) for k in keys):
             return None
-        window = counters
-        if previous and previous[0] == frequency and all(numeric(previous[1].get(k))
-                                                         for k in keys):
-            delta = {k: counters[k] - previous[1][k] for k in keys}
-            if delta["active_time"] >= MIN_AIRTIME_WINDOW_MS and min(delta.values()) >= 0:
-                window = delta
+        previous = self.survey_previous
+        if previous is None or previous[0] != frequency:
+            self.survey_previous = (frequency, counters, at)
+            return None
+        delta = {k: counters[k] - previous[1][k] for k in keys}
+        restarted = min(delta.values()) < 0
+        if restarted:
+            self.survey_previous = (frequency, counters, at)
+            elapsed_ms = max(0.0, at - previous[2]) * 1000
+            if counters["active_time"] > elapsed_ms * 1.1 + 1000:
+                return None  # restarted long before the previous reading: no known window
+            window = counters
+        elif delta["active_time"] >= MIN_AIRTIME_WINDOW_MS:
+            self.survey_previous = (frequency, counters, at)
+            window = delta
+        else:
+            return None
         active = window["active_time"]
         if active < MIN_AIRTIME_WINDOW_MS:
             return None
+        busy = counters.get("busy_time") if numeric(counters.get("busy_time")) else None
+        if busy is not None and not restarted:
+            start = previous[1].get("busy_time")
+            busy = busy - start if numeric(start) else None
         return {"tx": round(100 * window["tx_time"] / active, 3),
                 "rx": round(100 * window["rx_time"] / active, 3),
+                "busy": round(100 * busy / active, 3) if busy is not None and busy >= 0 else None,
                 "window_s": round(active / 1000, 1)}
 
     def _read_override(self, radio, phy, name, errors):
@@ -271,7 +491,8 @@ class HealthReporter:
             return None
         return int(text)
 
-    def _radio(self, rf_up, wireless, control, linkstate, overrides, survey, errors):
+    def _radio(self, rf_up, wireless, control, linkstate, overrides, survey, survey_at, noise,
+               errors):
         values = {"rf.state": "on" if rf_up else "off" if rf_up is False else None}
         missing = []  # sources of temporarily unavailable measurements (unsupported is not news)
 
@@ -291,6 +512,12 @@ class HealthReporter:
         else:
             values["rf.auto_power_control"] = control["automatic"]
             values["rf.auto_power_control_aggressive"] = control["aggressive"]
+            # Configured settings (what a power cycle returns to, the ACK timeout distance, the
+            # antennas in use): published when the radio has them; their absence is not a gap.
+            settings = control.get("settings") or {}
+            for option, key in SETTINGS:
+                if _float(settings.get(option)) is not None:
+                    values[key] = _float(settings[option])
         level = None
         if rf_up:
             # The debugfs files need the phy name from `iwinfo info`; a reply without one means
@@ -303,16 +530,20 @@ class HealthReporter:
             put("rf.channel", wireless.get("channel") if numeric(wireless.get("channel")) else None,
                 source="wireless")
             put("rf.frequency_mhz", _round(wireless.get("frequency")), source="wireless")
+            uci = (control or {}).get("settings") or {}
+            for key, field in (("rf.country", "country"), ("rf.htmode", "htmode")):
+                text = wireless.get(field) or uci.get(field)
+                if isinstance(text, str) and text:
+                    values[key] = text[:64]
             link = linkstate or {}
             # A field the link report lacks is not reported by this firmware or linkstate
-            # configuration; a failed read of the report is a temporary gap.
+            # configuration; a failed or stale read of the report is a temporary gap.
             absent = "unavailable" if linkstate is None else "unsupported"
             width = _float(link.get("chan_width"))
             if width is None and control is not None:
                 width = _float(control.get("chanbw"))
             put("rf.bandwidth_mhz", width, state=absent, source="linkstate")
-            put("rf.noise_dbm", _round(link.get("noise"), digits=1), state=absent,
-                source="linkstate")
+            put("rf.noise_dbm", noise, state=absent, source="linkstate")
             put("rf.noise_peak_dbm", _round(link.get("noise_peak"), digits=1), state=absent,
                 source="linkstate")
             put("rf.channel_activity_pct", _round(_float(link.get("activity"))), state=absent,
@@ -332,11 +563,14 @@ class HealthReporter:
                 put(key, level if raw == NO_OVERRIDE else raw, source=name)
             # Transmit airtime: with the level, the best available proxy for the power the
             # amplifier turns into heat (the radio has no current or temperature sensors).
-            airtime = self._airtime(wireless.get("frequency"), survey) if survey else None
+            airtime = self._airtime(wireless.get("frequency"), survey, survey_at) \
+                if survey else None
             survey_state = self.capability_state.get("survey") or "unavailable"
             for key, part in (("rf.tx_airtime_pct", "tx"), ("rf.rx_airtime_pct", "rx"),
-                              ("rf.airtime_window_s", "window_s")):
-                put(key, airtime[part] if airtime else None, state=survey_state, source="survey",
+                              ("rf.busy_pct", "busy"), ("rf.airtime_window_s", "window_s")):
+                # With a window but no busy counter, this firmware does not count busy time.
+                state = "unsupported" if airtime and part == "busy" else survey_state
+                put(key, airtime[part] if airtime else None, state=state, source="survey",
                     warn=survey is None and "survey" in errors)
 
         warnings = []
@@ -360,46 +594,96 @@ class HealthReporter:
             summary.append(f"channel {values['rf.channel']}" + (f" ({band})" if band else ""))
         return status("radio", OK, ", ".join(summary), values)
 
-    def _links(self, linkstate):
-        now = self.clock()
-        reports, unidentified = [], 0
-        counts = {}
-        noise = _float(linkstate.get("noise"))
-        for kind, field, count_key in (("link", "sta_stats", "sta_count"),
-                                       ("mesh", "mesh_stats", "mesh_count")):
-            entries = linkstate.get(field) if isinstance(linkstate.get(field), list) else []
-            count = linkstate.get(count_key)
-            counts[kind] = count if numeric(count) else len(entries)
-            present = set()
-            for entry in entries:
+    def _links(self, now, linkstate, stations, station_files, noise, report_age, problems):
+        """Peers from the radio's link report and the kernel's station table (either may be None).
+        A peer is present when the latest source covering its kind lists it."""
+        unidentified, counts = 0, {}
+        current = {"link": {}, "mesh": {}}   # kind -> mac -> this pass's values
+        reported_snr = set()                 # stations whose link report carries its own SNR
+        if linkstate is not None:
+            for kind, field, count_key in (("link", "sta_stats", "sta_count"),
+                                           ("mesh", "mesh_stats", "mesh_count")):
+                entries = linkstate.get(field) if isinstance(linkstate.get(field), list) else []
+                count = linkstate.get(count_key)
+                counts[kind] = count if numeric(count) else len(entries)
+                for entry in entries:
+                    mac = peer_address(entry)
+                    if mac is None:
+                        unidentified += 1
+                        continue
+                    current[kind][mac] = {**_peer_values(f"{kind}.", entry),
+                                          **link_quality(kind, entry, noise)}
+                    if _measure(entry, SNR_FIELDS, -30, 90) is not None:
+                        reported_snr.add(mac)
+        if stations is not None:
+            for entry in stations:
                 mac = peer_address(entry)
                 if mac is None:
                     unidentified += 1
                     continue
-                present.add(mac)
-                self.peers[(kind, mac)] = {"seen": now, "values": {
-                    **_peer_values(f"{kind}.", entry), **link_quality(kind, entry, noise)}}
+                # The station table's format is known, so its signal and rate win; a SNR the
+                # radio reports itself beats one derived here.
+                quality = station_quality(entry, noise)
+                if mac in reported_snr:
+                    quality.pop("link.snr_db", None)
+                current["link"].setdefault(mac, {}).update(
+                    {**_station_table_values(entry), **quality})
+            counts.setdefault("link", len(stations))
+        for mac, values in station_files.items():
+            if mac in current["link"]:
+                current["link"][mac].update(values)
+        covered = {"link": linkstate is not None or stations is not None,
+                   "mesh": linkstate is not None}
+
+        reports = []
+        for kind in ("link", "mesh"):
+            for mac, values in current[kind].items():
+                self.peers[(kind, mac)] = {"seen": now, "values": values}
             for (peer_kind, mac), peer in self.peers.items():
                 if peer_kind != kind:
                     continue
-                values = {f"{kind}.present": mac in present, **peer["values"]}
-                if mac in present:
-                    reports.append(status(f"{kind}/{mac}", OK, "reported", values))
+                name = self.names.get(mac)
+                label = f"{name}: " if name else ""
+                named = {f"{kind}.name": name} if name else {}
+                component = f"{kind}/{mac}"
+                if mac in current[kind]:
+                    reports.append(status(component, OK, label + "reported",
+                                          {f"{kind}.present": True, **peer["values"], **named}))
+                elif not covered[kind]:
+                    reports.append(status(component, OK, label + "not observed (no link report)",
+                                          {f"{kind}.present": None, **named,
+                                           f"health.metric.{kind}.present.state": "unavailable"}))
                 else:
                     age = round(now - peer["seen"], 1)
-                    reports.append(status(f"{kind}/{mac}", OK, f"not reported for {age:g} s",
-                                          {f"{kind}.present": False, f"{kind}.last_seen_s": age}))
+                    reports.append(status(component, OK, f"{label}not reported for {age:g} s",
+                                          {f"{kind}.present": False, f"{kind}.last_seen_s": age,
+                                           **named}))
         lost = sorted((peer["seen"], key) for key, peer in self.peers.items() if peer["seen"] < now)
         for _, key in lost[:max(0, len(lost) - MAX_LOST_PEERS)]:
             del self.peers[key]
             reports = [r for r in reports if r["component"] != f"{key[0]}/{key[1]}"]
-        values = {"links.stations": counts["link"], "links.mesh_nodes": counts["mesh"]}
-        message = f"{counts['link']} station(s), {counts['mesh']} mesh node(s)"
+
+        values = {"links.stations": counts.get("link"), "links.mesh_nodes": counts.get("mesh")}
+        if stations is not None:
+            values["links.associated"] = len(stations)
+        if report_age is not None:
+            values["links.report_age_s"] = report_age
+        for key in [k for k, v in values.items() if v is None]:
+            values[f"health.metric.{key}.state"] = "unavailable"
+        parts = [f"{values['links.stations']} station(s)" if values["links.stations"] is not None
+                 else "stations unknown",
+                 f"{values['links.mesh_nodes']} mesh node(s)"
+                 if values["links.mesh_nodes"] is not None else "mesh nodes unknown"]
+        message = ", ".join(parts)
         if unidentified:
             values["links.unidentified"] = unidentified
             message += f"; entries without a recognizable address: {unidentified}"
-        return [status("links", OK, message, values)] + sorted(reports,
-                                                                key=lambda r: r["component"])
+        level = OK
+        if problems:
+            level = WARN
+            message = "measurement unavailable: " + "; ".join(sorted(problems)) + "; " + message
+        return [status("links", level, message, values)] + sorted(reports,
+                                                                  key=lambda r: r["component"])
 
     def _system(self, system):
         board = self.board or {}

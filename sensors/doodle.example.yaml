@@ -6,8 +6,8 @@ service: doodle
 name: mesh                      # rig instance / health identity; standalone compose project doodle_mesh
 # service/name/ros.namespace must match [a-z][a-z0-9_]*. Rig can supply name from vehicle.yaml.
 
-ros:
-  namespace: mesh               # defaults to name; the ROS node is /<namespace>/radio
+# ros:
+#   namespace: mesh             # defaults to name; the ROS node is /<namespace>/radio
 
 connection:
   type: ubus                    # the radio's JSON-RPC API (only supported transport)
@@ -23,7 +23,8 @@ connection:
     #   sudo rig provision --var doodle_radio_password='<password>'
     # rig fills it in on the vehicle from /etc/rig/vehicle.local.yaml, and `rig bake` never reads
     # that file, so artifacts carry only the marker. Standalone, put the password itself here and
-    # keep the config out of git. Quote it: YAML would turn 012345 into a number.
+    # keep the config out of git. Quote it, in single quotes if it contains \ or ": YAML would
+    # turn 012345 into a number and read a leading ! as a tag.
     # The launcher writes it to var/run/<name>.radio_password (0600) when it creates the
     # container; it never appears in the rendered compose or the container's environment.
     # tls_fingerprint_sha256: ""  # optional SHA-256 pin of the radio's certificate (64 hex
@@ -63,6 +64,19 @@ tx_power:
 #     rf.noise_dbm: {warn_above: -85}     # e.g. warn on a noisy channel
 #     link.signal_dbm: {warn_below: -80}  # e.g. warn per peer on a weak signal (also link.snr_db,
 #                                         #   link.loss_pct, mesh.quality_pct)
+#   peers:                      # optional names for peers (quote the MAC): link.name and messages
+#     "00:30:1a:12:34:57": gcs
+#   reverse_link_peers: 4       # peers whose per-station power-control files are read each poll
+#                               #   (2 radio requests per peer per poll; 0 = off)
+#
+# Network characterization flights: poll every second so link data is about 1 s apart rather
+# than 5 (at 20 m/s that is 20 m between samples instead of 100 m), and expire data sooner:
+# health:
+#   poll_interval_s: 1
+#   stale_after_s: 5
+# Each poll is about 9 radio requests plus 2 per reverse-link peer; check system.load_1m on the
+# bench at this rate before flying. The link report only changes every 2 s; the station table
+# (link.iw_*, link.signal_dbm, link.rate_mbps) is live. Record /diagnostics and /rosout.
 
 # Characterization mode, for characterization flights (docs/PLAN.md): off unless enabled. A faster
 # read-only poll of this radio and, if `gcs` is set, of the GCS radio over the mesh, published as
