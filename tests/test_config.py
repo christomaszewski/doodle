@@ -101,6 +101,18 @@ class ConfigTests(unittest.TestCase):
             with self.assertRaises(ConfigError, msg=raw):
                 dc.health(raw)
 
+    def test_a_misspelled_block_is_named_not_silently_dropped(self):
+        # Every nested block rejects unknown keys. At the top level (and under ros) an overlay
+        # may legitimately add keys this service does not read, so those are warned about: a
+        # misspelled `tx_power` would otherwise leave the power unmanaged without a word.
+        config = dc.load({**base(), "tx-power": {"startup": "low"}, "ros": {"namspace": "x"}})
+        self.assertEqual(config["tx_power"]["startup"], "unchanged")
+        text = " | ".join(config["warnings"])
+        self.assertIn("tx-power", text)
+        self.assertIn("tx_power", text)        # the known names, so the typo is obvious
+        self.assertIn("ros.namspace", text)
+        self.assertEqual(dc.load(base())["warnings"], [])
+
     def test_identity_must_be_safe_tokens(self):
         for bad in ({"name": "Mesh"}, {"name": "mesh;x"}, {"service": "1doodle"},
                     {"ros": {"namespace": "a/b"}}):

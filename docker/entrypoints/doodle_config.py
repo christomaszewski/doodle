@@ -24,6 +24,9 @@ KEYWORDS = ("unchanged", "off")
 # Sanity bounds only; the radio's own supported list decides at runtime.
 DBM_MIN, DBM_MAX = 0, 40
 
+TOP_KEYS = ("service", "name", "ros", "connection", "tx_power", "health", "characterization",
+            "zenoh")
+ROS_KEYS = ("namespace", "use_sim_time")
 UBUS_KEYS = {"host", "port", "scheme", "username", "password", "tls_fingerprint_sha256",
              "device", "uci_radio"}
 TX_POWER_KEYS = {"startup", "shutdown", "levels", "max_dbm"}
@@ -295,6 +298,13 @@ def load(cfg):
     if use_sim_time is not None and not isinstance(use_sim_time, bool):
         raise ConfigError("ros.use_sim_time must be true or false")
     zenoh_pairs, warnings = zenoh(cfg.get("zenoh"))
+    # Unknown keys here are not an error (a fleet overlay can add keys this service does not
+    # read), but never silent: a misspelled block would be a setting that is quietly not applied.
+    for where, block, known in (("", cfg, TOP_KEYS), ("ros.", ros, ROS_KEYS)):
+        unknown = sorted(str(key) for key in block if key not in known)
+        if unknown:
+            warnings.append(f"unknown key(s) ignored: {', '.join(where + key for key in unknown)} "
+                            f"(known here: {', '.join(known)})")
     return {
         "service": ident("service", cfg.get("service") or "doodle"),
         "name": name,
