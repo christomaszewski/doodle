@@ -155,6 +155,7 @@ class RosHealth:
         self.controller, self.stop_event, self.radio = controller, stop_event, radio
         self.collector = collector  # characterize.Collector in characterization mode, else None
         self.namespace = os.environ.get("DOODLE_NAMESPACE") or "/doodle"
+        self.use_sim_time = os.environ.get("DOODLE_USE_SIM_TIME", "").strip().lower() == "true"
         self.reporter = HealthReporter(os.environ.get("DOODLE_NAME") or self.namespace.strip("/"),
                                        os.environ.get("VEHICLE_ID", ""), config["health"])
         self.bridge = ParameterBridge(controller)
@@ -190,9 +191,14 @@ class RosHealth:
         # logger only feeds /rosout (see RosoutForwarder).
         rclpy.init(args=["--ros-args", "--disable-stdout-logs"], context=self.context,
                    signal_handler_options=SignalHandlerOptions.NO)
+        # In a replay or simulation session the node's ROS clock follows /clock (use_sim_time),
+        # which is what stamps /rosout. Health is about the live radio, so its heartbeat and
+        # Header stamps stay on the system clock (docs/SERVICE_HEALTH.md) and keep going while
+        # /clock is paused or absent.
+        overrides = [Parameter("use_sim_time", value=True)] if self.use_sim_time else None
         node = self.node = rclpy.create_node(
             "radio", namespace=self.namespace, context=self.context, use_global_arguments=False,
-            enable_rosout=True)
+            enable_rosout=True, parameter_overrides=overrides)
         publisher = node.create_publisher(DiagnosticArray, "/diagnostics", 10)
         stamp_clock = Clock(clock_type=ClockType.SYSTEM_TIME)
 
@@ -239,7 +245,8 @@ class RosHealth:
         # Parameter services use the node's default group; the heartbeat gets its own, so a
         # parameter request waiting on the radio never delays a publication.
         node.create_timer(self.reporter.settings["interval_s"], tick,
-                          callback_group=MutuallyExclusiveCallbackGroup())
+                          callback_group=MutuallyExclusiveCallbackGroup(),
+                          clock=Clock(clock_type=ClockType.STEADY_TIME))
         self.executor = MultiThreadedExecutor(num_threads=2, context=self.context)
         self.executor.add_node(node)
 

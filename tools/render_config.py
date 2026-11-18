@@ -76,6 +76,8 @@ def main() -> int:
     lines = [f"SERVICE={config['service']}",
              f"NAME={config['name']}",
              f"NAMESPACE=/{config['namespace']}",
+             # Empty = not set in the config; the launcher then follows RIG_SIM_TIME.
+             "USE_SIM_TIME=" + {None: "", True: "true", False: "false"}[config["use_sim_time"]],
              "DOODLE_CONFIG=" + shlex.quote(doodle_config.runtime_json(config)),
              "ZENOH_OVERRIDE=" + shlex.quote(config["zenoh_override"])]
     print("\n".join(lines))

@@ -184,6 +184,56 @@ class ComposeRenderTests(unittest.TestCase):
                              str(ROOT / "var/run/mesh.radio_password"))
             self.assertNotIn(PASSWORD, json.dumps(radio["environment"]))
 
+    def launch(self, config, *args, **extra):
+        env = {k: v for k, v in os.environ.items()
+               if not k.startswith(("DOODLE_", "RIG_", "COMPOSE_")) and k != "VEHICLE_ID"}
+        env.update(extra)
+        return subprocess.run([str(ROOT / "doodle-up"), str(config), *args], env=env,
+                              capture_output=True, text=True, timeout=60)
+
+    def test_image_plan_answers_for_a_fleet_config_with_unresolved_markers(self):
+        """`rig bake --bundle-images` asks `images` with per-vehicle markers still in the config
+        and without VEHICLE_ID or COMPOSE_PROJECT_NAME. The image never depends on them."""
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp, "mesh.yaml")
+            doc = yaml.safe_load((ROOT / "sensors/doodle.example.yaml").read_text())
+            doc["connection"]["ubus"]["host"] = "10.223.{{vehicle_id}}.52"
+            doc["tx_power"] = {"startup": "{{doodle_startup_power}}"}
+            config.write_text(yaml.safe_dump(doc))
+            result = self.launch(config, "images", RIG_IMAGE_REGISTRY="registry.example:5000",
+                                 RIG_IMAGE_TAG="v1")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(yaml.safe_load(result.stdout),
+                             ["registry.example:5000/doodle_radio:v1"])
+            pinned = self.launch(config, "images", DOODLE_IMAGE="r/doodle_radio@sha256:" + "a" * 64)
+            self.assertEqual(yaml.safe_load(pinned.stdout),
+                             ["r/doodle_radio@sha256:" + "a" * 64])
+            # Verbs that start or describe a real instance still need a resolved config.
+            for verb in ("config", "runtime-images"):
+                refused = self.launch(config, verb)
+                self.assertEqual(refused.returncode, 2, verb)
+                self.assertEqual(refused.stdout, "", verb)
+                self.assertIn("connection.ubus.host", refused.stderr)
+
+    def test_sim_time_follows_the_session_unless_the_config_sets_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp, "mesh.yaml")
+            doc = yaml.safe_load((ROOT / "sensors/doodle.example.yaml").read_text())
+            doc["connection"]["ubus"]["password"] = PASSWORD
+
+            def rendered(setting, **env):
+                doc["ros"] = {} if setting is None else {"use_sim_time": setting}
+                config.write_text(yaml.safe_dump(doc))
+                result = self.launch(config, "config", **env)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                compose = yaml.safe_load(result.stdout)
+                return compose["services"]["radio"]["environment"]["DOODLE_USE_SIM_TIME"]
+
+            self.assertEqual(rendered(None), "false")
+            self.assertEqual(rendered(None, RIG_SIM_TIME="1"), "true")
+            self.assertEqual(rendered(False, RIG_SIM_TIME="1"), "false")  # the config wins,
+            self.assertEqual(rendered(True), "true")                      # in both directions
+
 
 if __name__ == "__main__":
     unittest.main()

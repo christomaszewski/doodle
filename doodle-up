@@ -31,15 +31,40 @@ if ! docker compose version >/dev/null 2>&1; then
   exit 1
 fi
 
-# config -> SERVICE / NAME / NAMESPACE (plain tokens) and DOODLE_CONFIG / ZENOH_OVERRIDE
-# (shell-quoted by the renderer, safe for this eval). Never the password. Invalid config exits
-# here, before any container is touched.
+FILES=(-f "$REPO/docker/compose/compose.deploy.yaml")
+
+# No args = up. `status` -> `ps`. `tx-power` is ours; everything else goes to compose verbatim.
+ARGS=("$@")
+[ ${#ARGS[@]} -eq 0 ] && ARGS=(up)
+[ "${ARGS[0]}" = "status" ] && ARGS=(ps "${ARGS[@]:1}")
+
+# --- images: which image `up` would run, for `rig bake --bundle-images` ---------------------------
+# The image depends on the environment alone (DOODLE_IMAGE, RIG_IMAGE_REGISTRY, RIG_IMAGE_TAG),
+# never on the config, so this answers before the config is validated: a fleet artifact's config
+# still holds per-vehicle `{{var}}` markers (a radio address built from the vehicle id) that no
+# validator accepts, and rig sets neither VEHICLE_ID nor COMPOSE_PROJECT_NAME for this query.
+# The placeholders only satisfy the compose file's required variables; nothing is created.
+if [ "${ARGS[0]}" = "images" ]; then
+  export DOODLE_NAME=image_plan DOODLE_NAMESPACE=/image_plan DOODLE_CONFIG='{}'
+  export DOODLE_ZENOH_OVERRIDE="" DOODLE_USE_SIM_TIME=false DOODLE_PASSWORD_FILE=/dev/null
+  export COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-doodle_image_plan}"
+  exec "$PYTHON" "$REPO/tools/runtime_images.py" images "${FILES[@]}"
+fi
+
+# config -> SERVICE / NAME / NAMESPACE / USE_SIM_TIME (plain tokens) and DOODLE_CONFIG /
+# ZENOH_OVERRIDE (shell-quoted by the renderer, safe for this eval). Never the password. Invalid
+# config exits here, before any container is touched.
 ENV_LINES="$("$PYTHON" "$REPO/tools/render_config.py" "$CONFIG_ABS")"
 eval "$(printf '%s\n' "$ENV_LINES" | sed 's/^/export /')"
 
 export DOODLE_NAME="$NAME"
 export DOODLE_NAMESPACE="$NAMESPACE"
 export DOODLE_ZENOH_OVERRIDE="$ZENOH_OVERRIDE"
+# The ROS clock: the config's ros.use_sim_time wins in both directions; left unset, a rig replay
+# or simulation session (RIG_SIM_TIME non-empty) turns it on. Diagnostics stamps and the
+# heartbeat stay on the system clock either way (docs/SERVICE_HEALTH.md).
+export DOODLE_USE_SIM_TIME="${USE_SIM_TIME:-${RIG_SIM_TIME:+true}}"
+DOODLE_USE_SIM_TIME="${DOODLE_USE_SIM_TIME:-false}"
 # The password from the config is written to this file (0600) only when a container is created,
 # and compose mounts it as a secret. Only the PATH appears in the rendered compose, so `config`
 # output and `rig bake` artifacts carry no secret.
@@ -50,17 +75,10 @@ export DOODLE_CONFIG
 # rig owns the compose project name (it exports COMPOSE_PROJECT_NAME per call); honor it when
 # inherited, fall back to <service>_<name> standalone. NEVER pass -p.
 export COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-${SERVICE}_${NAME}}"
-FILES=(-f "$REPO/docker/compose/compose.deploy.yaml")
 
-# No args = up. `status` -> `ps`. `tx-power` is ours; everything else goes to compose verbatim.
-ARGS=("$@")
-[ ${#ARGS[@]} -eq 0 ] && ARGS=(up)
-[ "${ARGS[0]}" = "status" ] && ARGS=(ps "${ARGS[@]:1}")
-
-case "${ARGS[0]}" in
-  runtime-images|images)
-    exec "$PYTHON" "$REPO/tools/runtime_images.py" "${ARGS[0]}" "${FILES[@]}" ;;
-esac
+if [ "${ARGS[0]}" = "runtime-images" ]; then
+  exec "$PYTHON" "$REPO/tools/runtime_images.py" runtime-images "${FILES[@]}"
+fi
 if [ "${ARGS[0]}" = up ] && [ "${RIG_RUNTIME_IMAGE_PINS+x}" ]; then
   # Reject changed images or startup overrides before writing the password secret.
   "$PYTHON" "$REPO/tools/runtime_images.py" validate-pins "${FILES[@]}" -- "${ARGS[@]:1}"

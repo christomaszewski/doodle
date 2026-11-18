@@ -78,6 +78,14 @@ class ConfigTests(unittest.TestCase):
         with self.assertRaises(ConfigError):
             dc.load({**base(), "connection": {"type": "ssh", "ubus": {"host": "h"}}})
 
+    def test_sim_time_setting_is_optional_and_strict(self):
+        self.assertIsNone(dc.load(base())["use_sim_time"])  # unset: the launcher follows the session
+        for value in (True, False):
+            self.assertIs(dc.load(dict(base(), ros={"use_sim_time": value}))["use_sim_time"], value)
+        for value in ("true", 1, 0, "yes"):
+            with self.assertRaisesRegex(ConfigError, "use_sim_time"):
+                dc.load(dict(base(), ros={"use_sim_time": value}))
+
     def test_identity_must_be_safe_tokens(self):
         for bad in ({"name": "Mesh"}, {"name": "mesh;x"}, {"service": "1doodle"},
                     {"ros": {"namespace": "a/b"}}):

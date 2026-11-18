@@ -15,7 +15,13 @@ verbs:
   # silently lower the power of the link operators may be using. Runtime changes go through the
   # launcher's own `tx-power` verb.
 ros_distro: lyrical
-replay: { start: false }  # replay recorded diagnostics without contacting a live radio
+# start: false -- replay plays back the recorded diagnostics and does not contact a live radio
+#   unless the operator selects the instance (`rig replay RUN --include-service doodle`).
+# sim_time: true -- in a replay or simulation session (RIG_SIM_TIME) the node runs with
+#   use_sim_time unless the config sets ros.use_sim_time itself. That moves the node's ROS clock
+#   (the /rosout stamps); the health heartbeat and its Header stamps stay on the system clock, as
+#   docs/SERVICE_HEALTH.md requires of every health publisher.
+replay: { start: false, sim_time: true }
 # Infra: the radio is the vehicle's network link, like the zenoh router and mavlink-router. rig
 # brings infra up before every sensor and autonomy stack and takes it down after them, so the
 # link is at its startup power before anything else starts and the shutdown power is applied
@@ -35,6 +41,16 @@ build:
   # No build.platforms: scopes select CPUs, without adding a runtime suffix to the tag.
   architectures: [arm64, amd64]
   capabilities: {no_cache: true, platforms: true}
+
+# What the instance puts on the ROS graph, for `rig graph --check` and `rig sim` (which refuses a
+# service that publishes /clock or a simulator-owned topic). Names without a leading slash are under
+# the instance namespace /<name>. The node also has the tx_power parameter (standard parameter
+# services, not listed).
+interface:
+  publishes:
+    - {topic: /diagnostics, type: diagnostic_msgs/msg/DiagnosticArray}
+    # Only with characterization.enabled in the instance config.
+    - {topic: radio/characterization, type: std_msgs/msg/String}
 
 # No `msgs:` block: the service uses only diagnostic_msgs, std_msgs (characterization snapshots)
 # and rcl_interfaces (the tx_power parameter), which ros-core and the fleet-ros base already carry.

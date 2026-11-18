@@ -60,6 +60,9 @@ class RosHealthTests(unittest.TestCase):
                         DOODLE_CONTROL_SOCKET=str(tmp / "control.sock"),
                         DOODLE_TARGET_FILE=str(tmp / "target.json"))
         self.env.pop("DOODLE_DIAGNOSTICS", None)
+        self.env.pop("DOODLE_USE_SIM_TIME", None)
+        if self._testMethodName == "test_sim_time_leaves_health_on_the_system_clock":
+            self.env["DOODLE_USE_SIM_TIME"] = "true"  # what doodle-up exports under RIG_SIM_TIME
         self.log = open(tmp / "supervisor.log", "w+")
         self.addCleanup(self.log.close)
         self.process = subprocess.Popen([sys.executable, str(SUPERVISOR), "serve"], env=self.env,
@@ -107,12 +110,24 @@ class RosHealthTests(unittest.TestCase):
         request.parameters = [Parameter("tx_power", value=value).to_parameter_msg()]
         return self.call(client, request).results[0]
 
-    def get_param(self):
+    def get_param(self, name="tx_power"):
         from rcl_interfaces.srv import GetParameters
         from rclpy.parameter import parameter_value_to_python
         client = self.node.create_client(GetParameters, "/mesh/radio/get_parameters")
-        request = GetParameters.Request(names=["tx_power"])
+        request = GetParameters.Request(names=[name])
         return parameter_value_to_python(self.call(client, request).values[0])
+
+    def test_sim_time_leaves_health_on_the_system_clock(self):
+        """A replay or simulation session moves the node's ROS clock to /clock. Nobody publishes
+        /clock here (a paused or absent simulator): the heartbeat must keep going and keep its
+        system-clock stamps, or a live radio would read as stale to the dashboard."""
+        from diagnostic_msgs.msg import DiagnosticArray
+        messages = []
+        self.node.create_subscription(DiagnosticArray, "/diagnostics", messages.append, 10)
+        self.assertIs(self.get_param("use_sim_time"), True)
+        self.spin_until(lambda: len(messages) >= 3, 60, "diagnostics without /clock")
+        stamp = messages[-1].header.stamp
+        self.assertAlmostEqual(stamp.sec + stamp.nanosec / 1e9, time.time(), delta=30)
 
     def test_characterization_snapshots(self):
         from std_msgs.msg import String

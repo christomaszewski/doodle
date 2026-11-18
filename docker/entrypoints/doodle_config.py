@@ -283,11 +283,16 @@ def load(cfg):
     cfg = _mapping(cfg, "config")
     name = ident("name", cfg.get("name") or "doodle")
     ros = _mapping(cfg.get("ros"), "ros")
+    # None = not set here: the launcher then follows the session (rig's RIG_SIM_TIME).
+    use_sim_time = ros.get("use_sim_time")
+    if use_sim_time is not None and not isinstance(use_sim_time, bool):
+        raise ConfigError("ros.use_sim_time must be true or false")
     zenoh_pairs, warnings = zenoh(cfg.get("zenoh"))
     return {
         "service": ident("service", cfg.get("service") or "doodle"),
         "name": name,
         "namespace": ident("ros.namespace", ros.get("namespace") or name),
+        "use_sim_time": use_sim_time,
         "connection": connection(cfg.get("connection")),
         "tx_power": tx_power(cfg.get("tx_power")),
         "health": health(cfg.get("health")),
