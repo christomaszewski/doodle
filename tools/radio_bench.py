@@ -23,6 +23,7 @@ Passwords come from DOODLE_BENCH_PASSWORD (and _B if the radios differ) or a pro
 """
 import argparse
 import base64
+import contextlib
 import getpass
 import json
 import os
@@ -45,6 +46,7 @@ import supervisor  # noqa: E402
 POLL = 0.25               # s between looks while a switch settles
 SAMPLE = 1.0              # s between link reports in `capture`
 SETTLE = 20.0             # s a radio gets to obey a restoring `chswitch`
+LOST_LOOKS = 3            # unanswered looks in a row before radio b counts as lost
 RF_TIMEOUT = 90.0         # s for RF to come back (docs/RADIO_API.md: observed < 40)
 REBOOT_TIMEOUT = 240.0    # s for a radio to reboot and bring RF up
 EXEC_TIMEOUT = 30.0       # s for one `file exec`
@@ -76,9 +78,11 @@ PRINTABLE = re.compile(rb"[\x20-\x7e\t]{5,}")  # what `strings` would print from
 MAX_READ_BYTES = 256 * 1024  # larger files (busybox and friends) are skipped, and counted
 MAX_HITS = 200
 SEARCH_BUDGET = 300.0     # s for the whole search on one radio; what it did not reach is listed
-SECRET = re.compile(r"key|pass|pswd|psk|secret|token", re.I)
-SECRET_VALUE = re.compile(r"((?:key|pass\w*|pswd|psk|secret|token)\w*['\"]?\s*[=: ]\s*).*", re.I)
-SECRET_FLAG = re.compile(r"(\s-k\s+)\S+")  # how the Setup Wizard's command line holds the mesh key
+SECRET = re.compile(r"key|pass|pwd|pswd|psk|secret|token|community", re.I)
+SECRET_VALUE = re.compile(
+    r"((?:key|pass\w*|pwd|pswd|psk|secret|token|community)\w*['\"]?\s*[=: ]\s*).*", re.I)
+# How the Setup Wizard's command line holds the mesh key: one word, or one quoted value.
+SECRET_FLAG = re.compile(r"""(\s-k\s+)(?:'[^']*'|"[^"]*"|\S+)""")
 
 
 def redact(value):
@@ -188,8 +192,13 @@ class Node:
                 wireless = self.api.wireless()
                 seen.update(frequency=wireless.get("frequency"), channel=wireless.get("channel"),
                             tx_power=wireless.get("txpower"))
-                seen["peers"] = len(self.api.call("iwinfo", "assoclist", {
-                    "device": self.api.device}).get("results") or [])
+                try:
+                    seen["peers"] = len(self.api.call("iwinfo", "assoclist", {
+                        "device": self.api.device}).get("results") or [])
+                except ReplyError:
+                    # Optional (docs/RADIO_API.md: not yet seen on this firmware) and it decides
+                    # nothing: a radio that refuses it is up, with an unknown peer count.
+                    pass
         except RadioError as error:
             seen["error"] = str(error)
         return seen
@@ -388,8 +397,12 @@ class Bench:
                     warnings.append(f"radio {node.name} hears its peer at {signal_dbm} dBm: too "
                                     "strong, add attenuation or separation")
             supported = node.frequencies()
-            if supported and target not in supported:
-                problems.append(f"radio {node.name} does not list {target} MHz")
+            if not supported:
+                problems.append(f"radio {node.name} lists no frequencies, so {target} MHz cannot "
+                                "be checked against what it supports")
+            for frequency in sorted({target, home}):  # home too: a failed switch sends it there
+                if supported and frequency not in supported:
+                    problems.append(f"radio {node.name} does not list {frequency} MHz")
         if stay and len(frequencies) == 2:
             if len(set(frequencies.values())) > 1:
                 problems.append("the radios are on different channels: " + ", ".join(
@@ -423,6 +436,16 @@ class Bench:
     def reachable(self, node):
         return "error" not in self.look(node)
 
+    def lost(self, node):
+        """No answer to LOST_LOOKS looks in a row. One missed poll is not a lost radio, and what
+        follows from "lost" (sending radio a away to find b) moves the whole mesh."""
+        for look in range(LOST_LOOKS):
+            if self.reachable(node):
+                return False
+            if look + 1 < LOST_LOOKS:
+                self.sleep(4 * POLL)
+        return True
+
     def controller(self, node, directory):
         """The supervisor's own Controller on this radio, with a throwaway target file."""
         stop = threading.Event()
@@ -434,8 +457,10 @@ class Bench:
     def restore(self, power, channel=True):
         """Both radios home at their starting power, by the least invasive way that works. RF is
         toggled only on a radio with a wired path of its own: through the mesh it would strand it.
-        With no --home (a `check` without a channel switch), or after a `switch` that completed
-        (channel false), only the power is put back."""
+        On one wire radio a is not toggled either while radio b is with it: a would go home alone
+        and b, reached only through a, would be cut off. They are then left together, not home.
+        With no --home (a `check` without a channel switch), when no switch was ever sent, or
+        after a `switch` that completed (channel false), only the power is put back."""
         steps = []
 
         def attempt(what, action):
@@ -455,10 +480,19 @@ class Bench:
                 if seen["frequency"] != home and "error" not in seen:
                     attempt(f"{node.name}: chswitch home", lambda: node.switch(self.home))
                     self.until(lambda: self.on(node, home), SETTLE)
-            if not self.separate and not self.reachable(self.b):
+            if not self.separate and self.lost(self.b):
                 self.rendezvous(attempt)
             for node in self.wired:  # an RF toggle reloads the saved config
                 if not self.on(node, home):
+                    if not self.separate and self.reachable(self.b):
+                        # Radio b answers, so it is with radio a on this channel, and it is
+                        # reached only through a. A toggle would take a to its saved channel
+                        # alone and cut b off: the link is worth more than a being home.
+                        steps.append(f"{node.name}: RF toggle skipped: radio b is with it on "
+                                     f"{self.look(node)['frequency']} MHz and would be left "
+                                     "there alone")
+                        continue
+
                     def toggle():
                         self.rf(node, False)
                         self.rf(node, True)
@@ -727,14 +761,20 @@ def hop(bench, args):
     after = {node.name: node.saved() for node in nodes}
     completed = sum("data" in one["events"] for one in rounds)
     wanted = args.repeats * 2
-    return {"ok": completed == wanted, "rounds": rounds, "saved": {
-        "before": before, "away": during, "after": after}, "findings": {
+
+    def changed(first, second, key):
+        """True or False only when both readings exist: these answers decide whether a power
+        cycle recovers a stranded radio, so one that could not be read is "unknown"."""
+        return {name: "unknown" if first[name].get(key) is None or second[name].get(key) is None
+                else first[name][key] != second[name][key] for name in second}
+
+    rewritten = changed(before, after, "config_mtime")
+    return {"ok": completed == wanted and "unknown" not in rewritten.values(), "rounds": rounds,
+            "saved": {"before": before, "away": during, "after": after}, "findings": {
         "switches_completed": f"{completed}/{wanted}", "timing": timing(rounds),
         "tx_power_changed": power_changed,
-        "saved_config_rewritten": {name: before[name].get("config_mtime")
-                                   != after[name].get("config_mtime") for name in before},
-        "saved_channel_changed_while_away": {name: before[name].get("channel")
-                                             != during[name].get("channel") for name in during}}}
+        "saved_config_rewritten": rewritten,
+        "saved_channel_changed_while_away": changed(before, during, "channel")}}
 
 
 def missed(bench, args):
@@ -832,16 +872,24 @@ def check(bench, args):
         items.add("SKIP", "power and channel changes", "not confirmed")
         return {"ok": not items.failed(), "checks": items.items}
     power = {name: view["tx_power"] for name, view in seen.items()}
+    switched = False  # only a switch that was sent has anything to bring back
     try:
         power_round_trip(bench, items)
-        if bench.to is not None:
-            channel_round_trip(bench, items)
-        else:
+        if bench.to is None:
             items.add("SKIP", "mesh-wide channel switch",
                       "pass --to and --home, built from what `discover` shows")
+        else:
+            _, problems, _ = bench.preflight()
+            if problems:
+                items.add("FAIL", "mesh-wide channel switch",
+                          "not tried, no radio was moved: " + "; ".join(problems))
+            else:
+                switched = True
+                channel_round_trip(bench, items)
     except (Exception, KeyboardInterrupt) as error:  # whatever happened, the radios go home
         items.add("FAIL", "changes", f"{type(error).__name__}: {error}")
-    restored = bench.restore(power)
+    with finishing():
+        restored = bench.restore(power, channel=switched)
     items.add("PASS" if restored["ok"] else "FAIL", "both radios back where they started",
               "; ".join(restored["steps"]))
     return {"ok": not items.failed(), "checks": items.items, "restored": restored}
@@ -1013,11 +1061,8 @@ def power_round_trip(bench, items):
 
 
 def channel_round_trip(bench, items):
-    """One `chswitch` request to radio a should move both radios; one to radio b, both back."""
-    _, problems, _ = bench.preflight()
-    if problems:
-        items.add("SKIP", "mesh-wide channel switch", "; ".join(problems))
-        return
+    """One `chswitch` request to radio a should move both radios; one to radio b, both back.
+    The caller has run preflight: nothing here checks whether a switch may be sent."""
     for sender, target in ((bench.a, bench.to), (bench.b, bench.home)):
         events = bench.move(sender, target)
         name = f"one request to {sender.name} moves both radios to {target['frequency']} MHz"
@@ -1064,7 +1109,12 @@ def run(bench, args):
             "stay there until the next switch" if stay else
             f"both radios move between {bench.home['frequency']} and {bench.to['frequency']} MHz "
             "with `message-system chswitch`")
-    if not (args.yes or bench.confirm(args.stage, [move])):
+    also = {"missed": ["radio b's RF is turned off before the switch, so that it misses it, and "
+                       "back on afterwards"],
+            "recover": ["each radio's RF is turned off and on again"
+                        + ("" if getattr(args, "skip_reboot", False) else
+                           ", then radio a is rebooted on the test channel")]}
+    if not (args.yes or bench.confirm(args.stage, [move, *also.get(args.stage, [])])):
         print("cancelled, nothing was changed", file=sys.stderr)
         return 1
     try:
@@ -1072,8 +1122,14 @@ def run(bench, args):
     except (Exception, KeyboardInterrupt) as error:  # whatever happened, the radios go home
         report = {"ok": False, "findings": {"error": f"{type(error).__name__}: {error}"}}
     stays = bool(report.get("stay"))  # a completed `switch` keeps its channel, not its power
-    report["warnings"], report["restored"] = warnings, bench.restore(power, channel=not stays)
-    bench.log.report(report)
+    report["warnings"] = warnings
+    try:
+        with finishing():
+            report["restored"] = bench.restore(power, channel=not stays)
+    finally:  # whatever restore() did or did not manage, it is on record
+        report.setdefault("restored", {"ok": False, "at_home": False, "state": {},
+                                       "steps": ["restore did not finish"]})
+        bench.log.report(report)
     print(json.dumps(report["findings"], indent=2, default=str))
     if stays:
         print(f"both radios stay on {bench.to['frequency']} MHz until the next switch (back home: "
@@ -1086,9 +1142,13 @@ def outcome(report):
     restored = report.get("restored")
     if restored is None or restored["ok"]:
         return 0 if report["ok"] else 1
+    together = any("RF toggle skipped" in step for step in restored.get("steps", []))
     print(f"NOT RESTORED: {json.dumps(restored['state'], default=str)}\n"
-          "See 'If a radio is stranded' in docs/RADIO_BENCH.md. A power cycle reloads the saved "
-          "config.", file=sys.stderr)
+          + ("Both radios are together on a channel that is not home, and still linked: radio "
+             "a's RF was not toggled, which would have cut radio b off. Send `switch` with the "
+             "home JSON again." if together else
+             "See 'If a radio is stranded' in docs/RADIO_BENCH.md. A power cycle reloads the "
+             "saved config."), file=sys.stderr)
     return 3
 
 
@@ -1143,9 +1203,36 @@ def interrupted(*_):
     raise KeyboardInterrupt
 
 
+@contextlib.contextmanager
+def finishing():
+    """While the radios are brought home, Ctrl-C, SIGTERM and a closed terminal are noted and
+    ignored: restore() says nothing for up to a minute or two, a second Ctrl-C then is likely,
+    and it would leave the radios wherever they are. Every wait inside is bounded."""
+    def wait(*_):
+        print("still bringing the radios home; this ends by itself", file=sys.stderr, flush=True)
+
+    print("bringing both radios home (up to a few minutes); do not interrupt", file=sys.stderr,
+          flush=True)
+    previous = {}
+    for name in ("SIGINT", "SIGTERM", "SIGHUP"):
+        number = getattr(signal, name, None)
+        if number is not None:
+            try:
+                previous[number] = signal.signal(number, wait)
+            except ValueError:  # not the main thread: nothing to guard against here
+                pass
+    try:
+        yield
+    finally:
+        for number, handler in previous.items():
+            signal.signal(number, handler)
+
+
 def main(argv=None):
     args = parser().parse_args(argv)
-    signal.signal(signal.SIGTERM, interrupted)  # restore() runs on the way out
+    for name in ("SIGTERM", "SIGHUP"):  # like Ctrl-C: restore() runs on the way out
+        if hasattr(signal, name):
+            signal.signal(getattr(signal, name), interrupted)
     first, second = passwords()
     a, b = [Node(name, RadioAPI(host, args.username, password, device=args.device,
                                 uci_radio=args.uci_radio), host)
@@ -1160,7 +1247,7 @@ def main(argv=None):
                   timeout=getattr(args, "timeout", 90.0), separate=separate)
     try:
         return run(bench, args)
-    except KeyboardInterrupt:  # only reachable by interrupting preflight or restore() itself
+    except KeyboardInterrupt:  # only reachable by interrupting preflight: restore() cannot be
         print("interrupted: check that both radios are on the home channel", file=sys.stderr)
         return 130
     except RadioError as error:

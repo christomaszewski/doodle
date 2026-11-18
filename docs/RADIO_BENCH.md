@@ -61,6 +61,9 @@ python3 tools/radio_bench.py --a <radio-a> --b <radio-b> check --to '<json>' --h
 On one wire, radio b's RF is never toggled: through the mesh, that would cut it off until a power
 cycle. If radio b is left on the test channel, the tool sends radio a there to fetch it. If that
 fails too, power-cycle radio b, unless the saved config moved (see "If a radio is stranded").
+Radio a's RF is not toggled either while radio b is still with it: the toggle would take a to its
+saved channel alone and cut b off. If both radios ignore the request home, they are left together
+on the test channel with the link up, and the run ends with exit status 3.
 `discover`, `capture` and `hop` also work on one wire; `missed` and `recover` refuse to run.
 
 The tool reads your routes to tell the setups apart. Two radios behind one local interface count as
@@ -133,8 +136,13 @@ python3 tools/radio_bench.py --a <radio-a> --b <radio-b> recover --to '<json>' -
 ```
 
 Active stages refuse to start unless both radios are up on the home channel, hear exactly one peer
-and pass a ping across the mesh. Afterwards, even after Ctrl-C or a crash in a stage, they bring
-both radios home with `chswitch`, then an RF toggle if that fails, and restore the starting power.
+and pass a ping across the mesh, and unless both radios list the `--to` and `--home` frequencies.
+Afterwards, even after Ctrl-C or a crash in a stage, they bring both radios home with `chswitch`,
+then an RF toggle if that fails (on one wire, only for a radio the other is not with), and restore
+the starting power. While that runs, Ctrl-C is noted and ignored: every wait in it is bounded, and
+stopping it part-way would leave the radios wherever they are. `check` works the same way, and a
+channel switch it could not start (the radios are not on `--home`, say) is a FAIL with nothing
+moved.
 
 Exit status: 0 done, 1 a failed check or refusal, 3 **a radio was not restored**.
 
@@ -143,6 +151,11 @@ Exit status: 0 done, 1 a failed check or refusal, 3 **a radio was not restored**
 Exit 3 prints each radio's state. Power-cycle the stranded radio: that reloads its saved config.
 If `saved_config_rewritten` was true or `reboot_returns_home` was false, the saved config moved
 too, so a power cycle will not help. Set the channel back over the wired path in the web UI.
+`saved_config_rewritten: "unknown"` means the evidence could not be read (the stage then fails):
+treat it as true until a run shows otherwise.
+
+If the message says both radios are together and still linked, nothing is stranded: they did not
+obey the request home, on one wire. Send `switch` with the home JSON again.
 
 ## What the results decide
 

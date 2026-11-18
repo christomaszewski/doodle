@@ -194,7 +194,12 @@ Power-cycle the GCS radio to restore its saved power, and set the vehicle config
 - **Exit status 3, `NOT RESTORED`:** a radio was left on the test channel. On one wire the tool
   first sends the GCS radio to fetch the vehicle radio; if that failed, power-cycle the vehicle
   radio after landing. That reloads its saved channel, unless 3.3 showed
-  `saved_config_rewritten: true`, in which case set the channel back in its web UI over a wire.
+  `saved_config_rewritten` as `true` or `"unknown"`, in which case set the channel back in its
+  web UI over a wire.
+- **Exit status 3, "both radios are together … and still linked":** neither radio obeyed the
+  request home, so both are still on the test channel with the link up. The tool does not toggle
+  the GCS radio's RF in that state, which would cut the vehicle radio off. Send the switch home
+  again.
 - **`radio unreachable … BadStatusLine`:** fixed in the client (it reconnects once); if it still
   appears, rerun the command and send the output.
 

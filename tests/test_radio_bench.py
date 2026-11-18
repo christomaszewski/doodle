@@ -260,6 +260,17 @@ class RedactionTests(unittest.TestCase):
         self.assertEqual(redact({"mesh_key": "hunter2", "nested": [{"psk": "hunter2"}]}),
                          {"mesh_key": "<redacted>", "nested": [{"psk": "<redacted>"}]})
 
+    def test_other_spellings_of_a_secret(self):
+        self.assertNotIn("hunter2", redact("option pwd 'hunter2'"))
+        self.assertNotIn("hunter2", redact("snmp community hunter2"))
+        self.assertEqual(redact({"pwd": "hunter2", "community": "hunter2", "channel": "51"}),
+                         {"pwd": "<redacted>", "community": "<redacted>", "channel": "51"})
+
+    def test_a_quoted_key_with_spaces_is_redacted_whole(self):
+        for line in ("wizard -n mesh -k 'alpha beta gamma' -c 51",
+                     'wizard -n mesh -k "alpha beta gamma" -c 51'):
+            self.assertEqual(redact(line), "wizard -n mesh -k <redacted> -c 51")
+
     def test_the_lines_we_came_for_survive(self):
         line = """ubus call message-system chswitch '{"count":3,"frequency":2450}'"""
         self.assertEqual(redact(line), line)
@@ -428,6 +439,48 @@ class RefusalTests(BenchCase):
         status = run(self.bench(to=bench_to), argparse.Namespace(stage="hop", yes=False))
         self.assertEqual(status, 1)
         self.assertIn("does not list", " ".join(self.report()["refused"]))
+
+    def test_a_radio_that_lists_no_frequencies_is_refused(self):
+        # An empty list must not pass as "nothing against this frequency".
+        real = self.a._method
+        self.a._method = lambda obj, method, args: (
+            {"results": []} if (obj, method) == ("iwinfo", "freqlist") else real(obj, method, args))
+        self.assertRefused("lists no frequencies")
+
+    def test_a_home_frequency_the_radio_does_not_list_is_refused(self):
+        # A `switch` does not start from home, so nothing else would catch a mistyped --home
+        # before a failed switch sends both radios to it.
+        bench = self.bench(home=dict(BACK, frequency=2600))
+        status = run(bench, argparse.Namespace(stage="switch", yes=False))
+        self.assertEqual(status, 1)
+        self.assertIn("2600", self.report()["refused"][0])
+        self.assertEqual(self.changes(self.a) + self.changes(self.b), [])
+
+    def test_a_radio_without_a_station_table_is_still_up(self):
+        # `iwinfo assoclist` is optional (docs/RADIO_API.md: not yet seen on this firmware). A
+        # radio that refuses it is not a radio that is down.
+        for radio in (self.a, self.b):
+            radio.fail["iwinfo.assoclist"] = PERMISSION_DENIED
+        seen = self.bench().a.observe()
+        self.assertNotIn("error", seen)
+        self.assertIsNone(seen["peers"])
+        status, report = self.stage("hop")
+        self.assertEqual(status, 0)
+        self.assertEqual(report["findings"]["switches_completed"], "4/4")
+        self.assertHome()
+
+    def test_the_confirmation_names_everything_a_stage_does(self):
+        asked = {}
+        for stage in ("missed", "recover"):
+            bench = self.bench()
+            bench.confirm = lambda name, changes: asked.update({name: " ".join(changes)}) or False
+            defaults = {"watch": 20.0, "skip_reboot": False}
+            self.assertEqual(run(bench, argparse.Namespace(stage=stage, yes=False, **defaults)), 1)
+        self.assertIn("RF", asked["missed"])
+        self.assertIn("radio b", asked["missed"])
+        self.assertIn("RF", asked["recover"])
+        self.assertIn("reboot", asked["recover"])
+        self.assertEqual(self.changes(self.a) + self.changes(self.b), [])
 
     def test_the_same_frequency_twice(self):
         status = run(self.bench(to=BACK), argparse.Namespace(stage="hop", yes=False))
@@ -646,15 +699,43 @@ class OneWireTests(BenchCase):
         self.assertEqual(self.a.frequency, HOME)
         self.assertEqual(self.rf_toggles(self.b), [])
 
-    def test_radio_b_is_never_rf_toggled_while_it_is_still_reachable(self):
-        # Both stuck on the test channel: a's RF toggle reloads a saved config the switch wrote,
-        # so b stays reachable there. Toggling b now would cut it off until a power cycle.
-        self.a.persists = True
-        self.a.ignores_home = self.b.ignores_home = True
-        status, report = self.stage("hop", repeats=1)
+    def test_neither_radio_is_rf_toggled_while_they_are_together(self):
+        """Both stuck on the test channel, still linked. Toggling b would cut it off until a
+        power cycle. Toggling a reloads a's saved config: home, unless a switch rewrote it, so a
+        would leave alone and b, reached only through a, would be cut off just the same."""
+        for persists in (False, True):
+            with self.subTest(saved_config_rewritten=persists):
+                self.setUp()
+                self.a.persists = persists
+                self.a.ignores_home = self.b.ignores_home = True
+                status, report = self.stage("hop", repeats=1)
+                self.assertEqual(status, 3)  # not restored, and said so
+                self.assertEqual(self.rf_toggles(self.a) + self.rf_toggles(self.b), [])
+                self.assertEqual((self.a.frequency, self.b.frequency), (TEST, TEST))
+                self.assertTrue(self.a.linked())  # the link is what was kept
+                self.assertTrue([step for step in report["restored"]["steps"]
+                                 if "RF toggle skipped" in step])
+
+    def test_a_rejected_switch_does_not_split_radios_that_are_together(self):
+        """In flight on a test channel, the firmware rejects the next switch (and the one home).
+        Nothing moved; the tool must not then cut the link itself."""
+        for radio in (self.a, self.b):
+            radio._tune(TEST)
+            radio.fail["message-system.chswitch"] = 9
+        bench = self.bench(to=dict(TO, frequency=2470))
+        status = run(bench, argparse.Namespace(stage="switch", yes=False))
         self.assertEqual(status, 3)
-        self.assertTrue(self.rf_toggles(self.a))
-        self.assertEqual(self.rf_toggles(self.b), [])
+        self.assertEqual((self.a.frequency, self.b.frequency), (TEST, TEST))
+        self.assertTrue(self.a.linked())
+        self.assertEqual(self.rf_toggles(self.a) + self.rf_toggles(self.b), [])
+
+    def test_one_lost_answer_from_radio_b_is_not_a_lost_radio(self):
+        # Sending radio a away to "find" b moves the whole mesh: not on one missed poll.
+        bench = self.bench()
+        self.b.down_polls = 2
+        self.assertFalse(bench.lost(bench.b))
+        self.b._tune(TEST)  # really gone: on another channel, no route through the mesh
+        self.assertTrue(bench.lost(bench.b))
 
     def test_missed_and_recover_need_a_wire_to_b(self):
         for stage in ("missed", "recover"):
@@ -824,6 +905,20 @@ class CheckTests(BenchCase):
                          "PASS")
         self.assertHome()
 
+    def test_a_channel_check_that_cannot_start_moves_nothing_and_fails(self):
+        """The radios are not on --home (left on a test channel, or --home mistyped). The switch
+        is refused; "putting the radios back" must not then send them to --home."""
+        for radio in (self.a, self.b):
+            radio._tune(2470)
+        status, checks = self.check(to=TO, home=BACK)
+        self.assertEqual(status, 1)
+        self.assertEqual(checks["mesh-wide channel switch"]["status"], "FAIL")
+        self.assertIn("not home", checks["mesh-wide channel switch"]["detail"])
+        self.assertEqual(self.switches(self.a) + self.switches(self.b), [])
+        self.assertEqual((self.a.frequency, self.b.frequency), (2470, 2470))
+        self.assertEqual(checks["both radios back where they started"]["status"], "PASS")
+        self.assertEqual((self.a.txpower, self.b.txpower), (25, 25))
+
     def test_to_without_home_is_refused(self):
         status, checks = self.check(to=TO)
         self.assertEqual(status, 1)
@@ -931,6 +1026,40 @@ class RestoreTests(BenchCase):
         self.assertEqual(status, 1)
         self.assertIn("KeyboardInterrupt", self.report()["findings"]["error"])
         self.assertHome()
+
+    def test_a_second_interrupt_cannot_stop_the_radios_being_brought_home(self):
+        self.a.ignores_home = self.b.ignores_home = True  # restore has to wait, then toggle RF
+        bench = self.bench()
+        real_restore, real_sleep, sent = bench.restore, bench.sleep, []
+
+        def impatient(*args, **kwargs):
+            def sleep(seconds):
+                if not sent:  # the operator's second Ctrl-C, while restore waits
+                    sent.append(True)
+                    os.kill(os.getpid(), signal.SIGINT)
+                real_sleep(seconds)
+            bench.sleep = sleep
+            try:
+                return real_restore(*args, **kwargs)
+            finally:
+                bench.sleep = real_sleep
+        bench.restore = impatient
+        status = run(bench, argparse.Namespace(stage="hop", yes=True, repeats=1, dwell=1.0))
+        self.assertTrue(sent)
+        self.assertEqual(status, 1)
+        self.assertTrue(self.report()["restored"]["ok"])
+        self.assertHome()
+        self.assertIs(signal.getsignal(signal.SIGINT), signal.default_int_handler)  # put back
+
+    def test_saved_config_evidence_that_could_not_be_read_is_unknown_not_unchanged(self):
+        # RADIO_BENCH.md: `saved_config_rewritten` decides whether a power cycle recovers a
+        # stranded radio. "false" must mean it was seen not to change.
+        self.a.persists = self.b.persists = True
+        self.a.fail["file.stat"] = PERMISSION_DENIED
+        status, report = self.stage("hop", repeats=1)
+        self.assertEqual(report["findings"]["switches_completed"], "2/2")
+        self.assertEqual(report["findings"]["saved_config_rewritten"], {"a": "unknown", "b": True})
+        self.assertEqual(status, 1)  # an answer the flight depends on is missing
 
     def test_a_bug_in_a_stage_still_brings_the_radios_home(self):
         bench = self.bench()
