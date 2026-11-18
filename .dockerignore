@@ -1,8 +1,9 @@
-.git
-.github
-docs
-tests
-sensors
-radios
-**/__pycache__
-var
+# The image is built from docker/entrypoints/ alone (docker/Dockerfile.runtime COPYs nothing
+# else), so the build context is exactly that directory: tests, docs, tools, local radio configs,
+# var/ (generated password files) and anything added later never reach the builder, and none of
+# it can invalidate a cached layer. A new COPY source outside docker/entrypoints/ fails the build
+# until it is listed here.
+*
+!docker/entrypoints/
+**/__pycache__/
+**/*.pyc

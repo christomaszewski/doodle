@@ -1,39 +1,67 @@
-# syntax=docker/dockerfile:1
 # Runtime image for the doodle radio service: a Python supervisor on the ROS base, no compiled code.
 #
 #   docker build -f docker/Dockerfile.runtime -t doodle_radio:<tag> .
 #
-# Under rig, tools/build_image.sh forwards RIG_BASE_IMAGE so this image shares the deployment's one
-# base (fleet-ros); standalone builds use the slim ros-core parent.
+# No `# syntax=` line, on purpose: it makes every build, a fully cached one too, resolve
+# docker/dockerfile on Docker Hub before anything else, so a rate limit or a disconnected builder
+# (`rig build --offline`) fails a build that needs nothing from the network. Everything here
+# (COPY --chmod) is in the frontend built into BuildKit >= 0.10, i.e. Docker Engine 23 and every
+# buildx builder.
+#
+# Layers, most stable first, so a change rebuilds only what follows it:
+#   1. the parent                 the deployment's one base under rig, shared with every ROS service
+#   2. hold + apt policy          the same two instructions, in the same position, as the ouster
+#                                 service's: on a shared builder they are built once per parent and
+#                                 the registry and the vehicle store them once
+#   3. packages the parent lacks  nothing at all on the fleet base (no apt, no network)
+#   4. the service's own files    the only layers a code change rebuilds
 ARG ROS_DISTRO=lyrical
+# Under rig, tools/build_image.sh forwards RIG_BASE_IMAGE so this image is the deployment's one base
+# (fleet-ros = ros-base + the fleet RMW + rosbag2) plus a few small layers; rig passes it by digest,
+# so the cache below it holds until the base itself changes. Standalone builds use the slim
+# ros-core parent.
 ARG BASE_IMAGE=ros:${ROS_DISTRO}-ros-core
 
 FROM ${BASE_IMAGE}
-ARG ROS_DISTRO
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
-ENV DEBIAN_FRONTEND=noninteractive
-
 # Hold the parent's ROS packages and never upgrade past them (the fleet convergence rule behind
 # `rig image audit`): new packages install, parent-carried ones stay at the parent's versions.
+# Keep this instruction first and byte-identical to the other services' (see 2. above): an ARG or
+# ENV in front of it changes its cache key and ends the sharing.
 RUN dpkg-query -W -f='${Package} ${db:Status-Status}\n' 'ros-*' \
       | awk '$2 == "installed" {print $1}' | xargs -r apt-mark hold
+ARG ROS_DISTRO
+ENV DEBIAN_FRONTEND=noninteractive
 RUN printf 'APT::Install-Recommends "0";\nAPT::Install-Suggests "0";\nAPT::Get::Upgrade "false";\n' \
       > /etc/apt/apt.conf.d/99-rig-apt-policy
-# Both RMWs ship (compose selects one via RMW_IMPLEMENTATION); diagnostic_msgs is what the
-# health publisher sends, std_msgs carries characterization snapshots. Under the fleet-ros parent
-# these are already present.
-RUN apt-get update && apt-get install -y --no-install-recommends \
-      ros-${ROS_DISTRO}-rmw-fastrtps-cpp ros-${ROS_DISTRO}-rmw-zenoh-cpp \
-      ros-${ROS_DISTRO}-diagnostic-msgs ros-${ROS_DISTRO}-std-msgs \
-  && rm -rf /var/lib/apt/lists/*
+# Both RMWs ship (compose selects one via RMW_IMPLEMENTATION); diagnostic_msgs is what the health
+# publisher sends, std_msgs carries characterization snapshots. Only what the parent lacks is
+# installed: on the fleet base that is nothing, so this step neither reaches the network nor adds
+# files there, and the image is the shared base plus the service's own files. On ros-core it
+# installs rmw_zenoh_cpp.
+RUN wanted="ros-${ROS_DISTRO}-rmw-fastrtps-cpp ros-${ROS_DISTRO}-rmw-zenoh-cpp \
+            ros-${ROS_DISTRO}-diagnostic-msgs ros-${ROS_DISTRO}-std-msgs" \
+ && missing="" \
+ && for package in ${wanted}; do \
+      [ "$(dpkg-query -W -f='${db:Status-Status}' "${package}" 2>/dev/null)" = installed ] \
+        || missing="${missing} ${package}"; \
+    done \
+ && if [ -n "${missing}" ]; then \
+      echo "installing what the parent lacks:${missing}" \
+      && apt-get update \
+      && apt-get install -y --no-install-recommends --no-upgrade ${missing} \
+      && rm -rf /var/lib/apt/lists/*; \
+    else \
+      echo "the parent already carries every package; nothing to install"; \
+    fi
 
-COPY docker/entrypoints/ros-entrypoint.sh docker/entrypoints/healthcheck.sh \
+# The service's own files, last: a code change rebuilds from here.
+COPY --chmod=0755 docker/entrypoints/ros-entrypoint.sh docker/entrypoints/healthcheck.sh \
      docker/entrypoints/radioctl.sh /usr/local/bin/
 COPY docker/entrypoints/doodle_config.py docker/entrypoints/power.py \
      docker/entrypoints/radio_api.py docker/entrypoints/supervisor.py \
      docker/entrypoints/health.py docker/entrypoints/health_ros.py \
      docker/entrypoints/characterize.py /usr/local/bin/
-RUN chmod +x /usr/local/bin/ros-entrypoint.sh /usr/local/bin/healthcheck.sh /usr/local/bin/radioctl.sh
 
 # Fail the build, not the vehicle, if a module or the ROS interfaces don't import.
 RUN source "/opt/ros/${ROS_DISTRO}/setup.bash" \

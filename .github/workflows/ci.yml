@@ -25,7 +25,8 @@ jobs:
   # ---------------------------------------------------------------------------
   # Build the runtime image (no push: `rig build` / tools/build_image.sh
   # publishes), then run the supervisor, radio-client and ROS suites inside it so
-  # the INSTALLED entrypoints (and real rclpy) are what gets exercised.
+  # the INSTALLED entrypoints (and real rclpy) are what gets exercised. This is
+  # the standalone parent (ros-core); the layer cache is kept per architecture.
   # ---------------------------------------------------------------------------
   build-image:
     strategy:
@@ -59,6 +60,54 @@ jobs:
               test_characterize test_health_ros -v
 
   # ---------------------------------------------------------------------------
+  # The image as a vehicle runs it: on the deployment's one base (rig-infra's
+  # fleet-ros, built here as its own CI builds it). The base carries every
+  # package the service needs, so the build runs with the network off, and the
+  # result must be the base's own layers plus a few small ones: that is what
+  # lets the registry and the vehicle store the base once for all services.
+  # The default docker builder is used on purpose: a buildx container builder
+  # cannot see the base image built in this job.
+  # ---------------------------------------------------------------------------
+  fleet-base:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: christomaszewski/rig-infra
+          path: .rig-infra
+      - name: Build the fleet base
+        run: PUSH=0 .rig-infra/base/build.sh local ci
+      - name: Build on it with the network off
+        run: |
+          docker build --network=none --build-arg "ROS_DISTRO=$ROS_DISTRO" \
+            --build-arg BASE_IMAGE=local/fleet-ros:ci \
+            -f docker/Dockerfile.runtime -t local/doodle_radio:ci .
+      - name: The image is the base plus the service's own layers
+        run: |
+          python3 - <<'PY'
+          import json, subprocess
+
+          def layers(ref):
+              image = json.loads(subprocess.check_output(["docker", "image", "inspect", ref]))[0]
+              return image["RootFS"]["Layers"], image["Size"]
+
+          (base, base_size), (image, size) = layers("local/fleet-ros:ci"), layers("local/doodle_radio:ci")
+          assert image[:len(base)] == base, "the base's layers are not a prefix of the image's"
+          added = len(image) - len(base)
+          print(f"base layers: {len(base)}, added: {added}, added bytes: {size - base_size}")
+          assert added <= 6, f"{added} layers on top of the base"
+          assert size - base_size < 20 * 1024 * 1024, "the service's layers grew past 20 MB"
+          PY
+      - name: Test installed supervisor against the simulated radio
+        run: |
+          docker run --rm --init --network none \
+            -e DOODLE_TEST_ENTRYPOINT_DIR=/usr/local/bin \
+            -v "$PWD:/workspace:ro" -w /workspace/tests local/doodle_radio:ci \
+            python3 -m unittest test_radio_api test_supervisor test_service test_health \
+              test_characterize test_health_ros -v
+
+  # ---------------------------------------------------------------------------
   # rig launcher contract, executable (see rigging.yaml): `rig certify` renders
   # `doodle-up <config> config` under a poisoned fleet env and checks project
   # name, registry/tag agreement, ROS env passthrough, determinism, identity and
@@ -73,7 +122,8 @@ jobs:
           repository: christomaszewski/rig
           path: .rig
       - run: python3 -m pip install --user pyyaml
-      - run: sudo apt-get update && sudo apt-get install -y bubblewrap libseccomp2
+      # Bubblewrap for the isolated build check, with the namespace setup the runners need.
+      - uses: ./.rig/.github/actions/setup-build-probe
       - name: rig certify (launcher contract)
         run: ./.rig/rig certify --require-build-check --repo . --config sensors/doodle.example.yaml
 
@@ -90,6 +140,9 @@ jobs:
           repository: christomaszewski/rig
           path: .rig
       - run: python3 -m pip install --user pyyaml
+      # tools/rig-build.sh is rig's own helper, kept as an identical copy in the build context.
+      - name: Build helper matches rig's
+        run: cmp tools/rig-build.sh .rig/packaging/rig-build.sh
       - name: Portable builder and Rig scope selection
         run: |
           RIG_SOURCE="$PWD/.rig" python3 -m unittest discover -s tests -p 'test_build*.py' -v
