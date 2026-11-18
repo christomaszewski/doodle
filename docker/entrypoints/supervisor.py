@@ -22,6 +22,7 @@ import sys
 import threading
 import time
 
+import characterize
 import doodle_config
 import power
 from radio_api import RadioAPI, RadioError, AuthError, ReplyError
@@ -353,12 +354,12 @@ def read_password(path):
     return password
 
 
-def health_monitor(controller, config, stop_event, health_radio):
+def health_monitor(controller, config, stop_event, health_radio, collector=None):
     """The ROS diagnostics publisher, unless DOODLE_DIAGNOSTICS=off (tests without ROS)."""
     if os.environ.get("DOODLE_DIAGNOSTICS", "on") == "off":
         return contextlib.nullcontext()
     from health_ros import ros_health  # rclpy is imported only here
-    return ros_health(controller, config, stop_event, health_radio)
+    return ros_health(controller, config, stop_event, health_radio, collector=collector)
 
 
 def serve(*, monitor=health_monitor):
@@ -371,6 +372,10 @@ def serve(*, monitor=health_monitor):
     radio = RadioAPI.from_config(connection, password)
     # Diagnostics read with their own session and short timeouts, so they never wait on a change.
     health_radio = RadioAPI.from_config(connection, password, timeout=HEALTH_TIMEOUT)
+    # Characterization mode (off unless configured): read-only, on sessions of its own.
+    collector = characterize.Collector.from_config(config, password,
+                                                   os.environ.get("DOODLE_NAME", ""),
+                                                   os.environ.get("VEHICLE_ID", ""))
     controller = Controller(radio, config["tx_power"], TARGET_FILE, stop_event=stop_event)
     LOG.info("radio %s://%s as %s; target %s, shutdown %s", connection["scheme"],
              connection["host"], connection["username"], power.describe(controller.target),
@@ -400,7 +405,7 @@ def serve(*, monitor=health_monitor):
                 controller.shutdown()
 
             try:
-                with monitor(controller, config, stop_event, health_radio):
+                with monitor(controller, config, stop_event, health_radio, collector=collector):
                     try:
                         last_error, logged_at = None, 0.0
                         while not stop_event.is_set():
@@ -425,6 +430,8 @@ def serve(*, monitor=health_monitor):
                 finally:
                     radio.close()
                     health_radio.close()
+                    if collector is not None:
+                        collector.close()
                     path.unlink(missing_ok=True)
 
 

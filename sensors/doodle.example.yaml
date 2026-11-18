@@ -64,6 +64,17 @@ tx_power:
 #     link.signal_dbm: {warn_below: -80}  # e.g. warn per peer on a weak signal (also link.snr_db,
 #                                         #   link.loss_pct, mesh.quality_pct)
 
+# Characterization mode, for characterization flights (docs/PLAN.md): off unless enabled. A faster
+# read-only poll of this radio and, if `gcs` is set, of the GCS radio over the mesh, published as
+# JSON on /<namespace>/radio/characterization (std_msgs/String) for the bag. /diagnostics does not
+# change. The GCS radio is reached with this radio's password. Leave it off otherwise: the GCS poll
+# adds traffic on the link.
+# characterization:
+#   enabled: true
+#   poll_interval_s: 1            # seconds between snapshots
+#   gcs:                          # optional; same keys as connection.ubus except the password
+#     host: 10.223.18.60
+
 # Zenoh session settings (only with RMW_IMPLEMENTATION=rmw_zenoh_cpp); same block as the other rig
 # ROS services. `overrides` (nested config flattened to path=json pairs) is the useful part here;
 # shared_memory is accepted for uniformity but has no effect for this service's small messages.

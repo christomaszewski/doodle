@@ -16,6 +16,10 @@ What this service relies on, as measured on real hardware. Anything not listed u
   returns the JSON-RPC error `{"code":-32002,"message":"Access denied"}` → log in again.
 - Every call: `{"method":"call","params":[<session>,<object>,<method>,<args>]}`. The reply is
   `"result":[<ubus status>]` or `"result":[0,<data>]`.
+- Keep-alive: uhttpd closes idle connections (OpenWrt's default is after 20 s). On the bench
+  radios, the first request on such a connection after an operator prompt came back as a bad
+  status line (`0`) instead of a clean disconnect. The client reconnects once for either, but
+  retries a bad status line only on a reused connection.
 
 | ubus status | Meaning |
 |---|---|
@@ -41,6 +45,11 @@ What this service relies on, as measured on real hardware. Anything not listed u
 
 The `user` password is effectively root over the API, and since the June 2025 firmware the
 firewall accepts all incoming connections from the mesh. Fielded radios need a strong password.
+
+`file exec` is narrower than the ACL suggests. On the bench radios (2026-11), `/bin/sh` is refused
+for `user` (ubus status 6, permission denied), although the ACL grants `file` `*` `*`. The probed
+radio (2026-03.1) did run `/usr/sbin/iw` that way, which is how the service sets power;
+`tools/radio_bench.py check` reports whether a given radio will.
 
 ## Calls the service uses
 
@@ -151,9 +160,23 @@ host receipt time.
   `/etc/init.d/wow`, but no ubus object; licensing and a supported control interface are open
   questions. Not used.
 
+## Channel switching (not used by the service)
+
+- `message-system chswitch {count, model, frequency, bandwidth, mode_change, channel_idx}` exists
+  on 2026-03.1. Doodle's API reference lists a mesh-wide coordinated channel switch; the argument
+  meanings are behind a vendor login. Never called on hardware yet.
+- The `message-system` daemon is configured to broadcast on UDP 9994 over the `br-mrlan` bridge,
+  which includes the wired port. `link-recovery` holds a `recovery_wait_time`; whether it acts
+  without a Sense license is unknown. Both come from a saved 2025-06 config.
+- Other unused methods: `iwinfo freqlist`, `freqlist_reg` and `scan`.
+
 ## Not yet verified (needs a second radio)
+
+[RADIO_BENCH.md](RADIO_BENCH.md) covers the first and last two of these.
 
 - Per-peer formats in `linkstate` and the debugfs station files.
 - Automatic power control against a fixed level with a close peer.
 - Reported vs. radiated power (signal-strength change on a peer).
 - Whether a live power change interrupts the link.
+- `chswitch`: arguments, timing, whether it writes flash, and what a radio that misses it does.
+- Whether an RF toggle or a reboot returns a switched radio to its saved channel.

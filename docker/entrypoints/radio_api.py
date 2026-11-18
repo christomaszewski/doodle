@@ -111,6 +111,7 @@ class RadioAPI:
     def _http(self, payload, timeout):
         body = json.dumps(payload).encode()
         for attempt in (0, 1):
+            reused = self._conn is not None and self._conn.sock is not None
             try:
                 if self._conn is not None and self._conn.sock is None:
                     self.close()  # the radio closed the keep-alive connection
@@ -130,11 +131,15 @@ class RadioAPI:
             except ValueError:
                 self.close()
                 raise ReplyError("radio sent a reply that is not JSON") from None
-            except (ConnectionError, http.client.RemoteDisconnected) as error:
-                # A keep-alive connection the radio already closed: reconnect once.
+            except (ConnectionError, http.client.BadStatusLine) as error:
+                # A keep-alive connection the radio already closed: reconnect once. After an idle
+                # spell (an operator prompt on the bench) a reused connection can answer with a
+                # bad status line ("0") instead of a clean disconnect. On a new connection that
+                # is a real fault, so it is not retried.
                 self.close()
-                if attempt:
-                    raise RadioError(f"radio unreachable at {self.host}: {error}") from None
+                if attempt or not (reused or isinstance(error, ConnectionError)):
+                    raise RadioError(f"radio unreachable at {self.host}: "
+                                     f"{error.__class__.__name__}: {error}") from None
             except (OSError, http.client.HTTPException) as error:  # timeouts, TLS, DNS
                 self.close()
                 raise RadioError(f"radio unreachable at {self.host}: "

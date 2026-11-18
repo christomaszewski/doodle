@@ -75,8 +75,9 @@ class ParameterBridge:
 
 
 class RosHealth:
-    def __init__(self, controller, config, stop_event, radio):
+    def __init__(self, controller, config, stop_event, radio, collector=None):
         self.controller, self.stop_event, self.radio = controller, stop_event, radio
+        self.collector = collector  # characterize.Collector in characterization mode, else None
         self.namespace = os.environ.get("DOODLE_NAMESPACE") or "/doodle"
         self.reporter = HealthReporter(os.environ.get("DOODLE_NAME") or self.namespace.strip("/"),
                                        os.environ.get("VEHICLE_ID", ""), config["health"])
@@ -172,7 +173,27 @@ class RosHealth:
                 self.guarded(lambda: self.reporter.poll(self.radio))
                 self.stop_event.wait(interval)
 
-        for target, name in ((spin, "doodle-ros"), (poll, "doodle-health-poll")):
+        workers = [(spin, "doodle-ros"), (poll, "doodle-health-poll")]
+        if self.collector is not None:
+            from std_msgs.msg import String
+            snapshots = node.create_publisher(String, "~/characterization", 10)
+
+            def publish_snapshot():
+                message = String()
+                message.data = self.collector.poll_json()
+                snapshots.publish(message)
+
+            def characterize():
+                while not self.stop_event.is_set():
+                    started = time.monotonic()
+                    self.guarded(publish_snapshot)
+                    self.stop_event.wait(max(0.0, self.collector.interval
+                                             - (time.monotonic() - started)))
+
+            workers.append((characterize, "doodle-characterize"))
+            LOG.info("characterization mode: %s every %gs (%s)", snapshots.topic_name,
+                     self.collector.interval, ", ".join(self.collector.radios))
+        for target, name in workers:
             thread = threading.Thread(target=target, name=name, daemon=True)
             thread.start()
             self.threads.append(thread)
@@ -186,6 +207,8 @@ class RosHealth:
         for thread in self.threads:
             # A poll can be inside one bounded radio request; it is a daemon either way.
             thread.join(timeout=5)
+        if self.collector is not None:
+            self.collector.close()
         if self.executor is not None:
             self.executor.shutdown(timeout_sec=5)
         if self.node is not None:
@@ -195,9 +218,11 @@ class RosHealth:
 
 
 @contextmanager
-def ros_health(controller, config, stop_event, radio, *, start_timeout=START_TIMEOUT):
-    """Start diagnostics without making power control wait for ROS."""
-    health = RosHealth(controller, config, stop_event, radio)
+def ros_health(controller, config, stop_event, radio, *, start_timeout=START_TIMEOUT,
+               collector=None):
+    """Start diagnostics (and characterization snapshots, given a collector) without making power
+    control wait for ROS."""
+    health = RosHealth(controller, config, stop_event, radio, collector)
     controller.diagnostics = "starting"
 
     def launch():
