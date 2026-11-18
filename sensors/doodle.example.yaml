@@ -8,6 +8,9 @@ name: mesh                      # rig instance / health identity; standalone com
 
 # ros:
 #   namespace: mesh             # defaults to name; the ROS node is /<namespace>/radio
+#   use_sim_time: false         # the node's ROS clock (/rosout stamps). Unset, it follows a rig
+#                               # replay or simulation session (RIG_SIM_TIME); set, it wins.
+#                               # /diagnostics keeps system-clock stamps and its heartbeat.
 
 connection:
   type: ubus                    # the radio's JSON-RPC API (only supported transport)
@@ -27,6 +30,8 @@ connection:
     # turn 012345 into a number and read a leading ! as a tag.
     # The launcher writes it to var/run/<name>.radio_password (0600) when it creates the
     # container; it never appears in the rendered compose or the container's environment.
+    # After changing the password on the radio, update it here (or the rig var) and run `up`
+    # again: the running service picks it up at its next login, without a restart.
     # tls_fingerprint_sha256: ""  # optional SHA-256 pin of the radio's certificate (64 hex
     #                             # digits, colons allowed). Empty = encrypted but not
     #                             # authenticated. A renewed radio certificate changes it.
@@ -104,5 +109,7 @@ tx_power:
 #   ZENOH_CONFIG_OVERRIDE   optional path=json;... pairs applied before the config's zenoh block
 #   DOODLE_IMAGE            full image override; else [RIG_IMAGE_REGISTRY/]doodle_radio:RIG_IMAGE_TAG
 #   COMPOSE_PROJECT_NAME    rig-supplied project; standalone defaults to service_name
-#   DOODLE_SETTLE_TIMEOUT   seconds `up -d` waits for the target power (default 120)
+#   DOODLE_CONNECT_TIMEOUT  seconds `up -d` waits for the radio to answer at all (default 10)
+#   DOODLE_SETTLE_TIMEOUT   seconds `up -d` then waits for the target power (default 120)
+#   RIG_SIM_TIME            set by rig in replay/simulation sessions; see ros.use_sim_time
 #   DOODLE_PYTHON           launcher Python interpreter (default python3; requires PyYAML)

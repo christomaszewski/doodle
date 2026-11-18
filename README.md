@@ -89,6 +89,26 @@ only, `RIG_VAR_doodle_radio_password=unused rig image audit`, or put it under `v
 `vehicle.local.yaml` beside `vehicle.yaml` (gitignored, never baked). Rendering never contacts the
 radio; only `rig up` would, and it would just fail to log in.
 
+**Changing the radio's password.** Change it on the radio, provision the new value
+(`sudo rig provision --var doodle_radio_password='<new>'`) and run `rig up`. The launcher rewrites
+the mounted password file in place and the supervisor reads it at its next login, so the container
+is not recreated and the transmit power is not touched.
+
+**What rig can and cannot do with this service** (rig service contract v0.2.86):
+
+- `rig bake --bundle-images` works on a fleet artifact: the `images` verb answers from the
+  environment alone, so per-vehicle `{{vars}}` left in the config (a radio address built from
+  the vehicle id) do not stop it.
+- `rig sim` and `rig replay --include-service doodle` can start an instance: it declares its
+  graph `interface` and `replay.sim_time`. In such a session the node's ROS clock (the `/rosout`
+  stamps) follows `/clock` unless the config sets `ros.use_sim_time`; `/diagnostics` keeps its
+  heartbeat and system-clock stamps, because it reports a live radio.
+- No `standby` / `activate`: a fleet-wide standby must not lower the power of a link in use.
+- The Compose-only scripts of a resolved (single-vehicle) bake cannot start it. The container's
+  password is a file the launcher writes at `up`, deliberately absent from the rendered Compose
+  document and from every artifact, and those scripts never run the launcher. Use the fleet
+  artifact above, where the bundled rig runs the launcher on the vehicle.
+
 ## Tests
 
 ```bash
@@ -96,7 +116,8 @@ python3 -m unittest discover -s tests -v   # needs PyYAML; Docker Compose for th
 ```
 
 The suites run against a simulated radio (`tests/fake_radio.py`) whose replies follow the
-measured API. CI also builds the image, runs the supervisor and ROS suites inside it (real
+measured API. CI also builds the image on both parents (standalone ros-core, and the fleet base
+built from rig-infra with the network off), runs the supervisor and ROS suites inside each (real
 `/diagnostics` and parameter calls), and runs `rig certify`.
 
 ## Portable builds and replay startup
@@ -140,6 +161,16 @@ replay:
 This makes the replay scope build both CPUs and also opts replay into contacting the live radio.
 Normally leave the policy off and replay its recorded diagnostics. A later
 `replay --include-service doodle` selects startup only; it does not build missing image members.
+
+**Build cache and the shared base.** Under rig the image is the deployment's one base
+(`RIG_BASE_IMAGE`, fleet-ros) plus under 3 MB: the base already carries every package the service
+needs, so the build installs nothing and needs no network, and the registry and the vehicle store
+the base once for all ROS services. Its first two layers (the ROS package hold and the apt policy)
+are the same instructions in the same position as the ouster service's, so one builder builds
+them once per base. The service's own files are the last layers: a code change rebuilds only
+those (about a second), and the build context is `docker/entrypoints/` alone, so edits to docs,
+tests or tools rebuild nothing. There is no `# syntax=` line, which would make every build fetch
+the Dockerfile frontend from Docker Hub. `tests/test_dockerfile.py` holds these properties.
 
 Standalone `tools/build_image.sh REGISTRY TAG` retains host-native builds.
 `DOODLE_BUILD_PLATFORM=linux/amd64` selects a standalone CPU; Rig's `RIG_BUILD_PLATFORMS` takes

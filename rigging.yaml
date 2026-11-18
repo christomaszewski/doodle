@@ -8,8 +8,14 @@ verbs:
   down: "down"       # the supervisor applies tx_power.shutdown on SIGTERM; failure => nonzero
   status: "ps"       # rig may append `--format json` to parse `docker compose ps`
   logs: "logs"
-  config: "config"   # rendered compose; carries the password FILE PATH, never the password
+  # Rendered compose; carries the password FILE PATH, never the password. The launcher writes
+  # that file at `up`, so the Compose-only scripts of a resolved bake (which never run the
+  # launcher) cannot start this service; a fleet artifact runs the launcher on the vehicle.
+  config: "config"
+  # For `rig bake --bundle-images`: answers from the environment alone, before the config is
+  # validated, so per-vehicle {{vars}} left in a fleet artifact's config do not stop it.
   images: "images"
+  # For replay and simulation sessions; `up` then starts exactly RIG_RUNTIME_IMAGE_PINS.
   runtime-images: "runtime-images"
   # No operational-state trio (standby/activate/state) in v1: a fleet-wide standby must not
   # silently lower the power of the link operators may be using. Runtime changes go through the
